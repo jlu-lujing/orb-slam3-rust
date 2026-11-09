@@ -361,30 +361,29 @@ fn refine_pose(
         initial.translation.z,
     ]);
     let nullspaces: Vec<_> = bearings.iter().map(|bearing| nullspace(*bearing)).collect();
-    for _ in 0..8 {
-        let residual = bearing_residual(&x, &nullspaces, world_points);
-        let mut jacobian = DMatrix::<f64>::zeros(residual.len(), 6);
-        for column in 0..6 {
-            let step = 1e-7;
-            let mut plus = x.clone();
-            let mut minus = x.clone();
-            plus[column] += step;
-            minus[column] -= step;
-            let derivative = (bearing_residual(&plus, &nullspaces, world_points)
-                - bearing_residual(&minus, &nullspaces, world_points))
-                / (2.0 * step);
-            jacobian.set_column(column, &derivative);
-        }
+    for _ in 0..5 {
+        let (residual, jacobian) = bearing_residual_and_jacobian(&x, &nullspaces, world_points);
         let lhs = jacobian.transpose() * &jacobian;
         let rhs = jacobian.transpose() * residual;
         let Some(dx) = lhs.lu().solve(&rhs) else {
             break;
         };
-        if dx.iter().any(|value| !value.is_finite()) || dx.norm() > 10.0 {
+        let max_abs = dx.iter().map(|value| value.abs()).fold(0.0, f64::max);
+        let min_abs = dx
+            .iter()
+            .map(|value| value.abs())
+            .fold(f64::INFINITY, f64::min);
+        if !max_abs.is_finite() || max_abs > 5.0 || min_abs > 1.0 {
             break;
         }
+        let observation_step = &jacobian * &dx;
+        let converged = observation_step
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0, f64::max)
+            < 1e-5;
         x -= &dx;
-        if dx.norm() < 1e-8 {
+        if converged {
             break;
         }
     }
@@ -401,21 +400,173 @@ fn bearing_residual(
     nullspaces: &[(Vector3<f64>, Vector3<f64>)],
     world_points: &[Vector3<f64>],
 ) -> DVector<f64> {
-    let rotation =
-        UnitQuaternion::from_scaled_axis(Vector3::new(x[0], x[1], x[2])).to_rotation_matrix();
-    let translation = Vector3::new(x[3], x[4], x[5]);
+    bearing_residual_and_jacobian(x, nullspaces, world_points).0
+}
+
+fn bearing_residual_and_jacobian(
+    x: &DVector<f64>,
+    nullspaces: &[(Vector3<f64>, Vector3<f64>)],
+    world_points: &[Vector3<f64>],
+) -> (DVector<f64>, DMatrix<f64>) {
+    let variables = Dual6::from_coefficients(x);
+    let w = [variables[0], variables[1], variables[2]];
+    let t = [variables[3], variables[4], variables[5]];
     let mut residual = DVector::<f64>::zeros(2 * world_points.len());
+    let mut jacobian = DMatrix::<f64>::zeros(2 * world_points.len(), 6);
     for (index, point) in world_points.iter().enumerate() {
-        let camera_point = rotation * point + translation;
-        let unit = if camera_point.norm() > 1e-12 {
-            camera_point.normalize()
-        } else {
-            Vector3::zeros()
-        };
-        residual[2 * index] = nullspaces[index].0.dot(&unit);
-        residual[2 * index + 1] = nullspaces[index].1.dot(&unit);
+        let q = rodrigues_apply(
+            w,
+            [
+                Dual6::constant(point.x),
+                Dual6::constant(point.y),
+                Dual6::constant(point.z),
+            ],
+        );
+        let q = [q[0].add(t[0]), q[1].add(t[1]), q[2].add(t[2])];
+        let norm = q[0]
+            .mul(q[0])
+            .add(q[1].mul(q[1]))
+            .add(q[2].mul(q[2]))
+            .sqrt();
+        let unit = [q[0].div(norm), q[1].div(norm), q[2].div(norm)];
+        let (nr, ns) = nullspaces[index];
+        let residual_r = unit[0]
+            .mul(Dual6::constant(nr.x))
+            .add(unit[1].mul(Dual6::constant(nr.y)))
+            .add(unit[2].mul(Dual6::constant(nr.z)));
+        let residual_s = unit[0]
+            .mul(Dual6::constant(ns.x))
+            .add(unit[1].mul(Dual6::constant(ns.y)))
+            .add(unit[2].mul(Dual6::constant(ns.z)));
+        residual[2 * index] = residual_r.value;
+        residual[2 * index + 1] = residual_s.value;
+        for column in 0..6 {
+            jacobian[(2 * index, column)] = residual_r.derivative[column];
+            jacobian[(2 * index + 1, column)] = residual_s.derivative[column];
+        }
     }
-    residual
+    (residual, jacobian)
+}
+
+fn rodrigues_apply(w: [Dual6; 3], point: [Dual6; 3]) -> [Dual6; 3] {
+    let theta2 = w[0].mul(w[0]).add(w[1].mul(w[1])).add(w[2].mul(w[2]));
+    let theta = theta2.sqrt();
+    let small = theta2.value.abs() < 1e-12;
+    let a = if small {
+        Dual6::constant(1.0).sub(theta2.div(Dual6::constant(6.0)))
+    } else {
+        theta.sin().div(theta)
+    };
+    let b = if small {
+        Dual6::constant(0.5).sub(theta2.div(Dual6::constant(24.0)))
+    } else {
+        Dual6::constant(1.0).sub(theta.cos()).div(theta2)
+    };
+    let cross = [
+        w[1].mul(point[2]).sub(w[2].mul(point[1])),
+        w[2].mul(point[0]).sub(w[0].mul(point[2])),
+        w[0].mul(point[1]).sub(w[1].mul(point[0])),
+    ];
+    let double_cross = [
+        w[1].mul(cross[2]).sub(w[2].mul(cross[1])),
+        w[2].mul(cross[0]).sub(w[0].mul(cross[2])),
+        w[0].mul(cross[1]).sub(w[1].mul(cross[0])),
+    ];
+    [
+        point[0].add(a.mul(cross[0])).add(b.mul(double_cross[0])),
+        point[1].add(a.mul(cross[1])).add(b.mul(double_cross[1])),
+        point[2].add(a.mul(cross[2])).add(b.mul(double_cross[2])),
+    ]
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Dual6 {
+    value: f64,
+    derivative: [f64; 6],
+}
+
+impl Dual6 {
+    fn constant(value: f64) -> Self {
+        Self {
+            value,
+            derivative: [0.0; 6],
+        }
+    }
+
+    fn from_coefficients(values: &DVector<f64>) -> [Self; 6] {
+        std::array::from_fn(|index| Self {
+            value: values[index],
+            derivative: {
+                let mut derivative = [0.0; 6];
+                derivative[index] = 1.0;
+                derivative
+            },
+        })
+    }
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            value: self.value + other.value,
+            derivative: std::array::from_fn(|index| {
+                self.derivative[index] + other.derivative[index]
+            }),
+        }
+    }
+
+    fn sub(self, other: Self) -> Self {
+        Self {
+            value: self.value - other.value,
+            derivative: std::array::from_fn(|index| {
+                self.derivative[index] - other.derivative[index]
+            }),
+        }
+    }
+
+    fn mul(self, other: Self) -> Self {
+        Self {
+            value: self.value * other.value,
+            derivative: std::array::from_fn(|index| {
+                self.derivative[index] * other.value + self.value * other.derivative[index]
+            }),
+        }
+    }
+
+    fn div(self, other: Self) -> Self {
+        let inverse = 1.0 / other.value;
+        Self {
+            value: self.value * inverse,
+            derivative: std::array::from_fn(|index| {
+                (self.derivative[index] * other.value - self.value * other.derivative[index])
+                    * inverse
+                    * inverse
+            }),
+        }
+    }
+
+    fn sqrt(self) -> Self {
+        let value = self.value.sqrt();
+        let scale = 0.5 / value;
+        Self {
+            value,
+            derivative: std::array::from_fn(|index| self.derivative[index] * scale),
+        }
+    }
+
+    fn sin(self) -> Self {
+        let cosine = self.value.cos();
+        Self {
+            value: self.value.sin(),
+            derivative: std::array::from_fn(|index| self.derivative[index] * cosine),
+        }
+    }
+
+    fn cos(self) -> Self {
+        let negative_sine = -self.value.sin();
+        Self {
+            value: self.value.cos(),
+            derivative: std::array::from_fn(|index| self.derivative[index] * negative_sine),
+        }
+    }
 }
 
 fn angular_cost(
@@ -590,5 +741,39 @@ mod tests {
         let delta = solution.tcw.inverse() * expected;
         assert!(delta.rotation.angle().abs() < 2e-2);
         assert!(delta.translation.vector.norm() < 2e-2);
+    }
+
+    #[test]
+    fn analytic_bearing_jacobian_matches_finite_difference() {
+        let x = DVector::<f64>::from_row_slice(&[0.12, -0.08, 0.05, 0.3, -0.2, 0.7]);
+        let world_points = [
+            Vector3::new(-1.0, -0.4, 4.0),
+            Vector3::new(0.8, -0.3, 4.2),
+            Vector3::new(0.9, 0.6, 4.5),
+            Vector3::new(-0.7, 0.5, 4.8),
+            Vector3::new(0.2, -0.6, 5.2),
+            Vector3::new(-0.3, 0.7, 5.5),
+        ];
+        let rotations = UnitQuaternion::from_scaled_axis(Vector3::new(x[0], x[1], x[2]));
+        let translation = Vector3::new(x[3], x[4], x[5]);
+        let bearings = world_points.map(|point| (rotations * point + translation).normalize());
+        let nullspaces: Vec<_> = bearings.iter().map(|bearing| nullspace(*bearing)).collect();
+        let (_, jacobian) = bearing_residual_and_jacobian(&x, &nullspaces, &world_points);
+
+        let step = 1e-6;
+        for column in 0..6 {
+            let mut plus = x.clone();
+            let mut minus = x.clone();
+            plus[column] += step;
+            minus[column] -= step;
+            let finite = (bearing_residual(&plus, &nullspaces, &world_points)
+                - bearing_residual(&minus, &nullspaces, &world_points))
+                / (2.0 * step);
+            let analytic = jacobian.column(column);
+            assert!(
+                (&finite - analytic).norm() < 1e-7,
+                "column {column} differs"
+            );
+        }
     }
 }

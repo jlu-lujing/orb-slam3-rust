@@ -38,7 +38,7 @@ smoke sequence.
 | IMU noise scaling, preintegration boundary interpolation | Aligned, focused tests |
 | Monocular/stereo/RGB-D image preprocessing | Resize/remap wired, tests |
 | Right fisheye-rig observations in inertial pose optimization | Wired, tests |
-| Relocalization pose initialization | MLPnP nullspace+RANSAC+GN, planar/non-planar and outlier tests |
+| Relocalization pose initialization | MLPnP with exact forward-AD Jacobian, planar/non-planar and outlier tests |
 | TUM/EuRoC/KITTI trajectory semantics | Sensor/body/frame normalization aligned, tests |
 | Active-map reset | Thread synchronization, DB cleanup, map detachment, tests |
 | Bad-keyframe removal from BoW database | Implemented and tested |
@@ -65,22 +65,18 @@ smoke sequence.
 These are the material areas where behavior is not yet an exact algorithm-level
 match:
 
-1. **MLPnP Jacobian implementation.** The MLPnP linear estimator, RANSAC and
-   bearing-residual refinement are ported. The original's large hand-derived
-   Jacobian is replaced by finite differences; OpenCV EPnP remains only as a
-   fallback when the MLPnP estimate has no valid solution.
-2. **Loop candidate continuity.** A loop now requires three distinct,
+1. **Loop candidate continuity.** A loop now requires three distinct,
    consecutive current keyframes to select the same or an overlapping candidate
    neighborhood. The full ORB-SLAM3 retry bookkeeping and every common-region
    refinement branch are still simplified.
-3. **Map merge completeness.** Merge now moves contents, adds the loop edge,
+2. **Map merge completeness.** Merge now moves contents, adds the loop edge,
    optionally runs inertial merge BA, invokes the merge essential-graph
    optimizer, and rebuilds connections. Some relaunch-condition and
    spanning-tree bookkeeping details of `MergeLocal` remain simplified.
-4. **Accuracy parity.** No real EuRoC/TUM/KITTI trajectory was available in this
+3. **Accuracy parity.** No real EuRoC/TUM/KITTI trajectory was available in this
    workspace. The synthetic EuRoC smoke test validates execution and exports,
    not ATE/RPE parity.
-5. **C++ API/debug surface.** A few diagnostic methods such as timing injection
+4. **C++ API/debug surface.** A few diagnostic methods such as timing injection
    and legacy Atlas overloads are intentionally absent or represented by Rust
    APIs.
 
