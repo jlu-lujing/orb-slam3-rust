@@ -2003,6 +2003,28 @@ impl Tracking {
             .current_frame
             .as_ref()
             .map_or(self.init_id + 1, |frame| frame.id.saturating_add(1));
+        self.reset_runtime_state(next_frame_id);
+    }
+
+    /// Full reset (upstream `Tracking::Reset`): discard all trajectory history
+    /// and restart identifiers/state.
+    pub fn reset(&mut self) {
+        let next_frame_id = self
+            .current_frame
+            .as_ref()
+            .map_or(0, |frame| frame.id.saturating_add(1));
+        self.relative_frame_poses.clear();
+        self.references.clear();
+        self.frame_times.clear();
+        self.lost.clear();
+        self.reset_runtime_state(next_frame_id);
+        self.init_id = 0;
+        self.first_frame_id = 0;
+        self.initial_frame_id = 0;
+        self.last_reloc_frame_id = 0;
+    }
+
+    fn reset_runtime_state(&mut self, next_frame_id: usize) {
         self.state = TrackingState::NoImagesYet;
         self.last_processed_state = None;
         self.ready_to_initialize = false;
@@ -2026,10 +2048,6 @@ impl Tracking {
         self.ini_p3d.clear();
         self.queue_imu_data.clear();
         self.imu_from_last_frame.clear();
-        self.relative_frame_poses.shrink_to_fit();
-        self.references.shrink_to_fit();
-        self.frame_times.shrink_to_fit();
-        self.lost.shrink_to_fit();
         self.local_key_frames.clear();
         self.local_map_points.clear();
         self.t0 = 0.0;

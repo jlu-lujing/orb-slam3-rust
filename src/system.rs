@@ -6,7 +6,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex, OnceLock,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicI32, Ordering},
 };
 use std::thread::JoinHandle;
 use std::{
@@ -53,6 +53,7 @@ pub struct System {
     reset_active_map: AtomicBool,
     activate_localization_mode: AtomicBool,
     deactivate_localization_mode: AtomicBool,
+    last_big_change_seen: AtomicI32,
     shutdown: AtomicBool,
     threads: Mutex<Vec<JoinHandle<()>>>,
     vocabulary_file_path: PathBuf,
@@ -153,6 +154,7 @@ impl System {
             reset_active_map: AtomicBool::new(false),
             activate_localization_mode: AtomicBool::new(false),
             deactivate_localization_mode: AtomicBool::new(false),
+            last_big_change_seen: AtomicI32::new(0),
             shutdown: AtomicBool::new(false),
             threads: Mutex::new(Vec::new()),
             vocabulary_file_path: vocabulary_path.clone(),
@@ -493,6 +495,21 @@ impl System {
             .unwrap_or(1.0)
     }
 
+    /// Upstream `MapChanged`: reports each new big map change index once.
+    pub fn map_changed(&self) -> bool {
+        let current = self
+            .atlas
+            .get_last_big_change_idx()
+            .map_or(0, |index| index as i32);
+        let previous = self.last_big_change_seen.load(Ordering::SeqCst);
+        if previous < current {
+            self.last_big_change_seen.store(current, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn is_lost(&self) -> bool {
         self.tracking
             .get()
@@ -568,6 +585,36 @@ impl System {
             .store(false, Ordering::SeqCst);
     }
 
+    /// Full reset of the current session (`System::Reset` upstream).
+    pub fn reset(&self) {
+        if let Some(mapping) = self.local_mapping.get() {
+            mapping.request_reset();
+        }
+        if let Some(loop_closing) = self.loop_closing.get() {
+            loop_closing.request_reset();
+        }
+        if let Some(database) = self.keyframe_database.as_ref() {
+            database.clear();
+        }
+        self.atlas.clear_atlas();
+        self.atlas.create_new_map();
+        if matches!(
+            self.sensor,
+            Sensor::IMUStereo | Sensor::IMUMonocular | Sensor::IMURGBD
+        ) {
+            self.atlas.set_inertial_sensor();
+        }
+        if let Some(tracking) = self.tracking.get()
+            && let Ok(mut tracking) = tracking.lock()
+        {
+            tracking.reset();
+        }
+        crate::frame::set_next_frame_id(0);
+        crate::key_frame::set_next_id(0);
+        self.last_big_change_seen.store(0, Ordering::SeqCst);
+        self.reset_active_map.store(false, Ordering::SeqCst);
+    }
+
     pub fn reset_active_map(&self) {
         let current_map = self.atlas.get_current_map();
         if let Some(mapping) = self.local_mapping.get() {
@@ -589,6 +636,36 @@ impl System {
             tracking.reset_active_map(&current_map);
         }
         self.reset_active_map.store(false, Ordering::SeqCst);
+    }
+
+    /// Switch datasets using ORB-SLAM3's rule: reset a tiny map, otherwise
+    /// store it and create a new active map.
+    pub fn change_dataset(&self) {
+        let current_map = self.atlas.get_current_map();
+        if current_map.key_frames_in_map() < 12 {
+            self.reset_active_map();
+        } else {
+            if let Some(mapping) = self.local_mapping.get() {
+                mapping.request_reset_active_map(current_map.clone());
+            }
+            self.atlas.create_new_map();
+            if matches!(
+                self.sensor,
+                Sensor::IMUStereo | Sensor::IMUMonocular | Sensor::IMURGBD
+            ) {
+                self.atlas.set_inertial_sensor();
+            }
+            if let Some(tracking) = self.tracking.get()
+                && let Ok(mut tracking) = tracking.lock()
+            {
+                tracking.reset_active_map(&current_map);
+            }
+        }
+        if let Some(tracking) = self.tracking.get()
+            && let Ok(mut tracking) = tracking.lock()
+        {
+            tracking.new_dataset();
+        }
     }
 
     pub fn shutdown(&self) {
@@ -655,12 +732,28 @@ impl System {
         let Some(map) = self.largest_map() else {
             return write_tum_trajectory(path, &[]);
         };
+        self.save_trajectory_euroc_for_map(path, &map)
+    }
+
+    pub fn save_keyframe_trajectory_euroc(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let Some(map) = self.largest_map() else {
+            return write_tum_trajectory(path, &[]);
+        };
+        self.save_keyframe_trajectory_euroc_for_map(path, &map)
+    }
+
+    /// Upstream map-specific `SaveTrajectoryEuRoC` overload.
+    pub fn save_trajectory_euroc_for_map(
+        &self,
+        path: impl AsRef<Path>,
+        map: &Arc<crate::map::Map>,
+    ) -> io::Result<()> {
         let trajectory = self
             .tracking
             .get()
             .map(|tracking| {
                 tracking.lock().unwrap().frame_trajectory_for_export(
-                    &map,
+                    map,
                     self.uses_imu_body_trajectory(),
                     1e9,
                 )
@@ -669,16 +762,18 @@ impl System {
         write_tum_trajectory(path, &trajectory)
     }
 
-    pub fn save_keyframe_trajectory_euroc(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        let Some(map) = self.largest_map() else {
-            return write_tum_trajectory(path, &[]);
-        };
+    /// Upstream map-specific `SaveKeyFrameTrajectoryEuRoC` overload.
+    pub fn save_keyframe_trajectory_euroc_for_map(
+        &self,
+        path: impl AsRef<Path>,
+        map: &Arc<crate::map::Map>,
+    ) -> io::Result<()> {
         let trajectory = self
             .tracking
             .get()
             .map(|tracking| {
                 tracking.lock().unwrap().keyframe_trajectory_for_export(
-                    &map,
+                    map,
                     self.uses_imu_body_trajectory(),
                     1e9,
                     false,
@@ -775,6 +870,7 @@ impl System {
             reset_active_map: AtomicBool::new(false),
             activate_localization_mode: AtomicBool::new(false),
             deactivate_localization_mode: AtomicBool::new(false),
+            last_big_change_seen: AtomicI32::new(0),
             shutdown: AtomicBool::new(false),
             threads: Mutex::new(Vec::new()),
             vocabulary_file_path: PathBuf::new(),
@@ -935,7 +1031,7 @@ mod tests {
     use crate::key_frame::KeyFrame;
     use crate::key_frame_database::KeyFrameId;
     use crate::orb_vocabulary::{BowVector, OrbVocabulary};
-    use crate::test_helpers::build_frame;
+    use crate::test_helpers::{build_frame, dummy_voc};
 
     #[test]
     fn stereo_preprocessing_applies_rectification_maps() {
@@ -1032,5 +1128,33 @@ mod tests {
         let mono = System::new_for_test(Sensor::Monocular);
         assert!(mono.save_trajectory_tum("unused.txt").is_err());
         assert!(mono.save_trajectory_kitti("unused.txt").is_err());
+    }
+
+    #[test]
+    fn map_changed_reports_each_big_change_once() {
+        let system = System::new_for_test(Sensor::Stereo);
+        assert!(!system.map_changed());
+        system.atlas.inform_new_big_change();
+        assert!(system.map_changed());
+        assert!(!system.map_changed());
+    }
+
+    #[test]
+    fn full_reset_clears_database_and_starts_a_fresh_map() {
+        let mut system = System::new_for_test(Sensor::Stereo);
+        let old_map = system.atlas.get_current_map();
+        let keyframe = KeyFrame::from_frame(&build_frame(), old_map.clone());
+        old_map.add_key_frame(keyframe.clone());
+
+        let vocabulary = dummy_voc();
+        let database = Arc::new(KeyFrameDatabase::new(vocabulary));
+        system.keyframe_database = Some(database.clone());
+
+        system.reset();
+
+        let new_map = system.atlas.get_current_map();
+        assert_ne!(new_map.get_id(), old_map.get_id());
+        assert_eq!(new_map.key_frames_in_map(), 0);
+        assert_eq!(database._entry_count(), 0);
     }
 }

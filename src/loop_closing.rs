@@ -29,6 +29,7 @@ pub struct LoopClosing {
     active_loop_closing: bool,
     local_mapping: OnceLock<Weak<LocalMapping>>,
     key_frames: Mutex<VecDeque<Arc<KeyFrame>>>,
+    reset_all: AtomicBool,
     reset_active_map: Mutex<Option<Arc<Map>>>,
     finish_requested: AtomicBool,
     finished: AtomicBool,
@@ -60,6 +61,7 @@ impl LoopClosing {
             active_loop_closing,
             local_mapping: OnceLock::new(),
             key_frames: Mutex::new(VecDeque::new()),
+            reset_all: AtomicBool::new(false),
             reset_active_map: Mutex::new(None),
             finish_requested: AtomicBool::new(false),
             finished: AtomicBool::new(true),
@@ -89,12 +91,27 @@ impl LoopClosing {
         self.finish_requested.store(true, Ordering::SeqCst);
     }
 
+    pub fn request_reset(&self) {
+        self.reset_all.store(true, Ordering::SeqCst);
+        while self.reset_all.load(Ordering::SeqCst) {
+            if self.is_finished() {
+                self.reset_if_requested();
+                break;
+            }
+            std::thread::sleep(Duration::from_micros(3000));
+        }
+    }
+
     /// Drop queued keyframes from `map` and block until the loop-closing
     /// worker has acknowledged the request.
     pub fn request_reset_active_map(&self, map: Arc<Map>) {
         *self.reset_active_map.lock().unwrap() = Some(map);
         loop {
             if self.reset_active_map.lock().unwrap().is_none() {
+                break;
+            }
+            if self.is_finished() {
+                self.reset_if_requested();
                 break;
             }
             std::thread::sleep(Duration::from_micros(3000));
@@ -126,6 +143,10 @@ impl LoopClosing {
     }
 
     fn reset_if_requested(&self) {
+        if self.reset_all.swap(false, Ordering::SeqCst) {
+            self.key_frames.lock().unwrap().clear();
+            self.pending_match.lock().unwrap().take();
+        }
         let reset_map = self.reset_active_map.lock().unwrap().take();
         if let Some(map) = reset_map {
             self.key_frames.lock().unwrap().retain(|keyframe| {
@@ -270,9 +291,17 @@ impl LoopClosing {
         self.atlas.set_map_bad(source);
         target.increase_change_index();
 
-        if target.is_inertial() {
-            optimizer::merge_inertial_ba(current, candidate, None, &target);
-        }
+        let corrected = if target.is_inertial() {
+            optimizer::merge_inertial_ba(current, candidate, None, &target)
+        } else {
+            Self::loop_neighborhood(current)
+                .into_iter()
+                .map(|keyframe| (keyframe.id, optimizer::sim3_from_pose(&keyframe.get_pose())))
+                .collect()
+        };
+        let fuse_neighbors = Self::loop_neighborhood(candidate);
+        let fuse_points = Self::loop_points(&fuse_neighbors);
+        self.search_and_fuse(&corrected, &fuse_points);
 
         for keyframe in target.get_all_key_frames() {
             keyframe.update_connections();
@@ -573,5 +602,20 @@ mod tests {
         assert!(!loop_closing.confirm_candidate(11, 2));
         assert!(loop_closing.confirm_candidate(12, 2));
         assert!(!loop_closing.confirm_candidate(13, 2));
+    }
+
+    #[test]
+    fn reset_request_completes_even_if_loop_thread_is_not_running() {
+        let atlas = Arc::new(Atlas::from_kf_id(0));
+        let vocabulary = dummy_voc();
+        let database = Arc::new(KeyFrameDatabase::new(vocabulary.clone()));
+        let loop_closing = LoopClosing::new(atlas, database, vocabulary, true, true);
+        let map = Arc::new(Map::new());
+        let keyframe = KeyFrame::from_frame(&build_frame(), map.clone());
+        loop_closing.insert_key_frame(keyframe);
+
+        assert!(loop_closing.is_finished());
+        loop_closing.request_reset_active_map(map);
+        assert_eq!(loop_closing.keyframes_in_queue(), 0);
     }
 }

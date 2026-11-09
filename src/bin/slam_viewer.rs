@@ -197,6 +197,9 @@ impl ViewerApp {
         if ui.button("Reset active map").clicked() {
             self.system.reset_active_map();
         }
+        if ui.button("Reset session").clicked() {
+            self.system.reset();
+        }
         if ui.button("Save trajectory").clicked() {
             self.save_status = Some(
                 self.system

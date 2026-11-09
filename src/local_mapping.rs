@@ -484,6 +484,10 @@ impl LocalMapping {
             if !self.reset.lock().unwrap().reset_requested {
                 break;
             }
+            if self.check_finish() {
+                self.reset_if_requested();
+                break;
+            }
             std::thread::sleep(Duration::from_micros(3000));
         }
     }
@@ -497,6 +501,10 @@ impl LocalMapping {
         }
         loop {
             if !self.reset.lock().unwrap().reset_requested_active_map {
+                break;
+            }
+            if self.check_finish() {
+                self.reset_if_requested();
                 break;
             }
             std::thread::sleep(Duration::from_micros(3000));
