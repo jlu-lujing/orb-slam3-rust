@@ -371,6 +371,23 @@ impl Atlas {
         inner.bad_maps.insert(id, map);
     }
 
+    /// Atomically make `target` the active map while preserving `source`'s map
+    /// id, matching LoopClosing's post-merge `ChangeId` behavior.
+    pub fn merge_map_into(&self, source: &Arc<Map>, target: &Arc<Map>) {
+        let source_id = source.get_id();
+        let target_id = target.get_id();
+        let mut inner = self.inner.lock().unwrap();
+        inner.maps.remove(&source_id);
+        inner.maps.remove(&target_id);
+        target.change_id(source_id);
+        target.set_current_map();
+        source.set_bad();
+        inner.bad_maps.remove(&source_id);
+        inner.bad_maps.remove(&target_id);
+        inner.current_map = Some(target.clone());
+        inner.maps.insert(source_id, target.clone());
+    }
+
     pub fn remove_bad_maps(&self) {
         self.inner.lock().unwrap().bad_maps.clear();
     }

@@ -287,8 +287,7 @@ impl LoopClosing {
         }
         current.add_loop_edge(candidate);
         candidate.add_loop_edge(current);
-        self.atlas.set_current_map(target.clone());
-        self.atlas.set_map_bad(source);
+        self.atlas.merge_map_into(&source, &target);
         target.increase_change_index();
 
         let corrected = if target.is_inertial() {
@@ -627,6 +626,7 @@ mod tests {
         let loop_closing = LoopClosing::new(atlas.clone(), database, vocabulary, true, true);
         let source = Arc::new(Map::new());
         let target = Arc::new(Map::new());
+        let source_id = source.get_id();
         let current = KeyFrame::from_frame(&build_frame(), source.clone());
         let candidate = KeyFrame::from_frame(&build_frame(), target.clone());
         source.add_key_frame(current.clone());
@@ -644,6 +644,7 @@ mod tests {
 
         assert_eq!(source.key_frames_in_map(), 0);
         assert_eq!(target.key_frames_in_map(), 2);
+        assert_eq!(target.get_id(), source_id);
         assert_eq!(
             current.get_map().map(|map| map.get_id()),
             Some(target.get_id())
