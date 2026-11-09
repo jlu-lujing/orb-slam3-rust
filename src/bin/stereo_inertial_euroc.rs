@@ -1,3 +1,5 @@
+#![allow(dead_code, clippy::ptr_arg)]
+
 use clap::{Arg, Command};
 use nalgebra::Vector3;
 use opencv::imgcodecs::{IMREAD_GRAYSCALE, imread};
@@ -217,7 +219,7 @@ fn main() -> Result<(), RuntimeError> {
 
         info!("Loading images for sequence {}...", seq);
         let images = load_images(&path_cam0, &path_cam1, &path_timestamps)
-            .map_err(|e| RuntimeError::ImageLoadFailed(e))?;
+            .map_err(RuntimeError::ImageLoadFailed)?;
         let n = images.timestamps.len();
         n_images.push(n);
         total_images += n;
@@ -227,7 +229,7 @@ fn main() -> Result<(), RuntimeError> {
         info!("Images loaded");
 
         info!("Loading IMU for sequence {}...", seq);
-        let imu = load_imu(&path_imu).map_err(|e| RuntimeError::IMULoadFailed(e))?;
+        let imu = load_imu(&path_imu).map_err(RuntimeError::IMULoadFailed)?;
         n_imu.push(imu.timestamps.len());
         acc.push(imu.acc);
         gyro.push(imu.gyro);

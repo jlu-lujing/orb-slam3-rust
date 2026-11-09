@@ -73,6 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         show_graph: true,
         follow_camera: true,
         localization_mode: false,
+        paused: false,
         save_status: None,
     };
     let options = eframe::NativeOptions {
@@ -99,6 +100,7 @@ struct ViewerApp {
     show_graph: bool,
     follow_camera: bool,
     localization_mode: bool,
+    paused: bool,
     save_status: Option<String>,
 }
 
@@ -179,6 +181,13 @@ impl ViewerApp {
         }
 
         ui.separator();
+        if ui.checkbox(&mut self.paused, "Pause tracking").changed() {
+            if self.paused {
+                self.system.pause_tracking();
+            } else {
+                self.system.resume_tracking();
+            }
+        }
         if ui.button("Reset active map").clicked() {
             self.system.reset_active_map();
         }

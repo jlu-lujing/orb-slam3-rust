@@ -111,6 +111,12 @@ pub struct Calib {
     cov_walk: Vector6<f32>,
     pub is_set: bool,
 }
+impl Default for Calib {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Calib {
     pub fn new() -> Self {
         Calib {
@@ -157,6 +163,12 @@ pub struct IntegratedRotation {
     pub delta_r: Matrix3<f32>,
     pub right_j: Matrix3<f32>, // right jacobian
 }
+impl Default for IntegratedRotation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IntegratedRotation {
     pub fn new() -> Self {
         IntegratedRotation {
@@ -295,7 +307,7 @@ impl Preintegrated {
 
         // Update delta position dp and velocity dv (rely on no-updated delta rotation)
         self.dp = self.dp + self.dv * dt + 0.5 * self.dr * acc * dt * dt;
-        self.dv = self.dv + self.dr * acc * dt;
+        self.dv += self.dr * acc * dt;
 
         // Compute velocity and position parts of matrices A and B (rely on non-updated delta rotation)
         let w_acc = acc.cross_matrix();
@@ -313,8 +325,8 @@ impl Preintegrated {
         // Update positions and velocity jacobians wrt bias correction
         self.jpa = self.jpa + self.jva * dt - 0.5 * self.dr * dt * dt;
         self.jpg = self.jpg + self.jvg * dt - 0.5 * self.dr * dt * dt * w_acc * self.jrg;
-        self.jva = self.jva - self.dr * dt;
-        self.jvg = self.jvg - self.dr * dt * w_acc * self.jrg;
+        self.jva -= self.dr * dt;
+        self.jvg -= self.dr * dt * w_acc * self.jrg;
 
         // Update delta rotation
         let dri = IntegratedRotation::from_params(&ang, &self.b, dt);

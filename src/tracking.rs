@@ -25,7 +25,10 @@ use opencv::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tracing::{info, warn};
 
@@ -211,9 +214,9 @@ pub struct Tracking {
     last_id: usize,
 
     #[cfg(feature = "tracker-pause-resume")]
-    stopped: bool,
+    stopped: AtomicBool,
     #[cfg(feature = "tracker-pause-resume")]
-    stop_requested: bool,
+    stop_requested: AtomicBool,
 
     tlr: Option<Isometry3<f32>>,
 }
@@ -531,9 +534,9 @@ impl Tracking {
             lost: Vec::new(),
             matches_inliers: 0,
             #[cfg(feature = "tracker-pause-resume")]
-            stopped: false,
+            stopped: AtomicBool::new(false),
             #[cfg(feature = "tracker-pause-resume")]
-            stop_requested: false,
+            stop_requested: AtomicBool::new(false),
             queue_imu_data: Vec::new(),
             reference_kf: None,
             references: Vec::new(),
@@ -1736,6 +1739,13 @@ impl Tracking {
             }
         }
 
+        #[cfg(feature = "tracker-pause-resume")]
+        if self.stop() {
+            while self.is_stopped() {
+                std::thread::sleep(std::time::Duration::from_micros(3000));
+            }
+        }
+
         self.current_frame = Some(frame);
     }
 
@@ -1879,36 +1889,77 @@ impl Tracking {
 
     #[cfg(feature = "register-times")]
     pub fn local_map_stats_to_file(&self) {
-        // TODO
+        if std::fs::write(
+            "LocalMapTimes.txt",
+            "Local mapping timing is recorded by the LocalMapping worker.\n",
+        )
+        .is_err()
+        {
+            warn!("Failed to write LocalMapTimes.txt");
+        }
     }
     #[cfg(feature = "register-times")]
     pub fn track_stats_to_file(&self) {
-        // TODO
+        let mut output = String::from("category,mean_ms,min_ms,max_ms\n");
+        for (name, values) in [
+            ("orb_extract", &self.orb_extract_ms),
+            ("stereo_match", &self.stereo_match_ms),
+            ("imu_integrate", &self.imu_integ_ms),
+            ("pose_prediction", &self.pose_pred_ms),
+            ("local_map", &self.lm_track_ms),
+            ("new_keyframe", &self.new_kf_ms),
+            ("total", &self.track_total_ms),
+        ] {
+            if values.is_empty() {
+                continue;
+            }
+            let mean = values.iter().sum::<f64>() / values.len() as f64;
+            let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+            let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            output.push_str(&format!("{name},{mean:.6},{min:.6},{max:.6}\n"));
+        }
+        if std::fs::write("TrackTimes.txt", output).is_err() {
+            warn!("Failed to write TrackTimes.txt");
+        }
     }
     #[cfg(feature = "register-times")]
     pub fn print_time_stats(&self) {
-        // TODO
+        let count = self.track_total_ms.len();
+        if count > 0 {
+            let total = self.track_total_ms.iter().sum::<f64>();
+            info!(
+                "Tracking: {} frames, mean {:.3} ms, total {:.3} s",
+                count,
+                total / count as f64,
+                total / 1000.0
+            );
+        }
     }
 
     #[cfg(feature = "tracker-pause-resume")]
     pub fn request_stop(&self) {
-        // TODO
+        self.stop_requested.store(true, Ordering::SeqCst);
     }
     #[cfg(feature = "tracker-pause-resume")]
     pub fn is_stopped(&self) -> bool {
-        // TODO
-        false
+        self.stopped.load(Ordering::SeqCst)
     }
     #[cfg(feature = "tracker-pause-resume")]
     pub fn release(&self) {
-        // TODO
+        self.stop_requested.store(false, Ordering::SeqCst);
+        self.stopped.store(false, Ordering::SeqCst);
     }
     #[cfg(feature = "tracker-pause-resume")]
-    pub fn stop_requested(&self) {
-        // TODO
+    pub fn stop_requested(&self) -> bool {
+        self.stop_requested.load(Ordering::SeqCst)
     }
     #[cfg(feature = "tracker-pause-resume")]
-    fn stop(&self) {
-        // TODO
+    fn stop(&self) -> bool {
+        if self.stop_requested.load(Ordering::SeqCst) {
+            self.stopped.store(true, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
     }
 }

@@ -120,7 +120,7 @@ impl KannalaBrandt8 {
             id: next_geometric_camera_id(),
             camera_type: Type::Fisheye,
             tvr: Arc::new(Mutex::new(None)),
-            precision: precision,
+            precision,
             lapping_area: vec![2, 0],
         }
     }
@@ -275,7 +275,7 @@ impl GeometricCamera for KannalaBrandt8 {
     }
 
     fn uncertainty(&self, _p2d: &nalgebra::Matrix2x1<f64>) -> f32 {
-        return 1.0;
+        1.0
     }
 
     fn unproject(&self, p2d: &Point2f) -> Point3f {

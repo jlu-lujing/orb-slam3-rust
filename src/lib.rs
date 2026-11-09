@@ -1,3 +1,14 @@
+#![allow(dead_code)] // Reserved parity state and diagnostic fields are intentionally retained.
+#![allow(
+    clippy::disallowed_names,
+    clippy::field_reassign_with_default,
+    clippy::mutable_key_type,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::too_many_arguments,
+    clippy::unnecessary_unwrap
+)] // Signatures and index loops follow the upstream C++ implementation closely.
+
 pub mod atlas;
 pub mod camera_models;
 pub mod compat;

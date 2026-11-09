@@ -402,7 +402,7 @@ pub fn log_so3(r: &Matrix3<f64>) -> Vector3<f64> {
         (r[(1, 0)] - r[(0, 1)]) / 2.0,
     );
     let costheta = (tr - 1.0) * 0.5;
-    if costheta > 1.0 || costheta < -1.0 {
+    if !(-1.0..=1.0).contains(&costheta) {
         return w;
     }
     let theta = costheta.acos();
@@ -1014,7 +1014,7 @@ impl SparseOptimizer {
                 n_bad = 0;
             }
 
-            let mut rho = 0.0f64;
+            let mut rho;
             let mut qmax = 0i32;
             loop {
                 self.push_active();

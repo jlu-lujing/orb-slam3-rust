@@ -86,10 +86,10 @@ impl OrbMatcher {
 
                     // Get best and second matches with near keypoints
                     for idx in indices.into_iter() {
-                        if let Some(Some(it)) = f.map_points.get(idx) {
-                            if it.observations() > 0 {
-                                continue;
-                            }
+                        if let Some(Some(it)) = f.map_points.get(idx)
+                            && it.observations() > 0
+                        {
+                            continue;
                         }
 
                         if f.n_left.is_none() && f.u_right.get(idx).is_some_and(|&v| v > 0.0) {
@@ -158,85 +158,85 @@ impl OrbMatcher {
             }
 
             // Right-camera projection (stereo fisheye only).
-            if let Some(n_left) = f.n_left {
-                if mp.track_in_view_r() {
-                    let predicted_level = mp.track_scale_level_r();
-                    if predicted_level == -1 {
+            if let Some(n_left) = f.n_left
+                && mp.track_in_view_r()
+            {
+                let predicted_level = mp.track_scale_level_r();
+                if predicted_level == -1 {
+                    continue;
+                }
+
+                // The size of the window will depend on the viewing direction
+                let r = radius_by_viewing_cos(mp.track_view_cos_r());
+
+                let indices = f.get_features_in_area(
+                    mp.track_proj_xr(),
+                    mp.track_proj_yr(),
+                    r * f.scale_factors[predicted_level as usize],
+                    predicted_level - 1,
+                    predicted_level,
+                    true,
+                );
+
+                if indices.is_empty() {
+                    continue;
+                }
+
+                let mp_descriptor = mp.get_descriptor();
+
+                let mut best_dist = 256;
+                let mut best_level = None;
+                let mut best_dist2 = 256;
+                let mut best_level2 = None;
+                let mut best_idx = None;
+
+                // Get best and second matches with near keypoints
+                for idx in indices.into_iter() {
+                    if let Some(Some(it)) = f.map_points.get(idx + n_left)
+                        && it.observations() > 0
+                    {
                         continue;
                     }
 
-                    // The size of the window will depend on the viewing direction
-                    let r = radius_by_viewing_cos(mp.track_view_cos_r());
+                    let d = f.descriptors.row((idx + n_left) as i32).expect("get row");
+                    let dist = descriptor_distance(&mp_descriptor, &d);
 
-                    let indices = f.get_features_in_area(
-                        mp.track_proj_xr(),
-                        mp.track_proj_yr(),
-                        r * f.scale_factors[predicted_level as usize],
-                        predicted_level - 1,
-                        predicted_level,
-                        true,
-                    );
+                    let octave = f.keys_right.as_ref().unwrap()[idx].octave();
+                    if dist < best_dist {
+                        best_dist2 = best_dist;
+                        best_dist = dist;
+                        best_level2 = best_level;
+                        best_level = Some(octave);
+                        best_idx = Some(idx);
+                    } else if dist < best_dist2 {
+                        best_level2 = Some(octave);
+                        best_dist2 = dist;
+                    }
+                }
 
-                    if indices.is_empty() {
+                // Apply ratio to second match (only if best and second are in the same scale level)
+                if best_dist <= TH_HIGH {
+                    if best_level == best_level2
+                        && best_dist as f32 > self.nn_ratio * best_dist2 as f32
+                    {
                         continue;
                     }
 
-                    let mp_descriptor = mp.get_descriptor();
+                    let best_idx = best_idx.expect("best_idx set when best_dist <= TH_HIGH");
 
-                    let mut best_dist = 256;
-                    let mut best_level = None;
-                    let mut best_dist2 = 256;
-                    let mut best_level2 = None;
-                    let mut best_idx = None;
-
-                    // Get best and second matches with near keypoints
-                    for idx in indices.into_iter() {
-                        if let Some(Some(it)) = f.map_points.get(idx + n_left) {
-                            if it.observations() > 0 {
-                                continue;
-                            }
-                        }
-
-                        let d = f.descriptors.row((idx + n_left) as i32).expect("get row");
-                        let dist = descriptor_distance(&mp_descriptor, &d);
-
-                        let octave = f.keys_right.as_ref().unwrap()[idx].octave();
-                        if dist < best_dist {
-                            best_dist2 = best_dist;
-                            best_dist = dist;
-                            best_level2 = best_level;
-                            best_level = Some(octave);
-                            best_idx = Some(idx);
-                        } else if dist < best_dist2 {
-                            best_level2 = Some(octave);
-                            best_dist2 = dist;
-                        }
-                    }
-
-                    // Apply ratio to second match (only if best and second are in the same scale level)
-                    if best_dist <= TH_HIGH {
-                        if best_level == best_level2
-                            && best_dist as f32 > self.nn_ratio * best_dist2 as f32
-                        {
-                            continue;
-                        }
-
-                        let best_idx = best_idx.expect("best_idx set when best_dist <= TH_HIGH");
-
-                        // Also match with the stereo observation at the left
-                        // camera. `usize::MAX` is the "no match" sentinel.
-                        let left_partner = match f.right_to_left_match.as_ref() {
-                            Some(r2l) if r2l[best_idx] != usize::MAX => Some(r2l[best_idx]),
-                            _ => None,
-                        };
-                        if let Some(left_idx) = left_partner {
-                            f.map_points[left_idx] = Some(mp.clone());
-                            n_matches += 1;
-                        }
-
-                        f.map_points[best_idx + n_left] = Some(mp.clone());
+                    // Also match with the stereo observation at the left
+                    // camera. `usize::MAX` is the "no match" sentinel.
+                    let left_partner = match f.right_to_left_match.as_ref() {
+                        Some(r2l) if r2l[best_idx] != usize::MAX => Some(r2l[best_idx]),
+                        _ => None,
+                    };
+                    if let Some(left_idx) = left_partner {
+                        f.map_points[left_idx] = Some(mp.clone());
                         n_matches += 1;
                     }
+
+                    f.map_points[best_idx + n_left] = Some(mp.clone());
+                    n_matches += 1;
                 }
             }
         }
@@ -271,27 +271,145 @@ impl OrbMatcher {
 
         for i in 0..last_frame.n {
             let mp = last_frame.map_points.get(i);
-            if let Some(Some(mp)) = mp {
-                if !last_frame.outlier[i] {
-                    // Project
-                    let x_3dw = mp.get_world_pos();
-                    let x_3dc = t_cw * x_3dw;
+            if let Some(Some(mp)) = mp
+                && !last_frame.outlier[i]
+            {
+                // Project
+                let x_3dw = mp.get_world_pos();
+                let x_3dc = t_cw * x_3dw;
 
-                    let inv_zc = 1.0 / x_3dc[2];
+                let inv_zc = 1.0 / x_3dc[2];
 
-                    if inv_zc < 0. {
+                if inv_zc < 0. {
+                    continue;
+                }
+
+                let uv = current_frame.camera.project_n(&Point3::from(x_3dc));
+
+                let bounds = current_frame.constants.bounds;
+                if uv[0] < bounds.min_x || uv[0] > bounds.max_x {
+                    continue;
+                }
+                if uv[1] < bounds.min_y || uv[1] > bounds.max_y {
+                    continue;
+                }
+
+                let last_octave = if last_frame.n_left.is_none() || i < last_frame.n_left.unwrap() {
+                    last_frame.keys[i].octave()
+                } else {
+                    last_frame.keys_right.as_ref().expect("missing keys")
+                        [i - last_frame.n_left.expect("missing n left")]
+                    .octave()
+                };
+
+                // Search in a window, size depends on scale
+                let radius = th * current_frame.scale_factors[last_octave as usize];
+
+                let indices2 = {
+                    let (min_level, max_level) = if forward {
+                        (last_octave, -1)
+                    } else if backward {
+                        (0, last_octave)
+                    } else {
+                        (last_octave - 1, last_octave + 1)
+                    };
+                    current_frame
+                        .get_features_in_area(uv[0], uv[1], radius, min_level, max_level, false)
+                };
+
+                if indices2.is_empty() {
+                    continue;
+                }
+
+                let d_mp = mp.get_descriptor();
+
+                let mut best_dist = 256;
+                let mut best_idx2 = 0;
+
+                for i2 in indices2 {
+                    if let Some(Some(mp)) = current_frame.map_points.get(i2)
+                        && mp.observations() > 0
+                    {
                         continue;
                     }
-
-                    let uv = current_frame.camera.project_n(&Point3::from(x_3dc));
-
-                    let bounds = current_frame.constants.bounds;
-                    if uv[0] < bounds.min_x || uv[0] > bounds.max_x {
-                        continue;
+                    if current_frame.n_left.is_none() && current_frame.u_right[i2] > 0. {
+                        let ur = uv[0] - current_frame.b_fx * inv_zc;
+                        let er = (ur - current_frame.u_right[i2]).abs();
+                        if er > radius {
+                            continue;
+                        }
                     }
-                    if uv[1] < bounds.min_y || uv[1] > bounds.max_y {
-                        continue;
+                    let d = current_frame
+                        .descriptors
+                        .row(i2 as i32)
+                        .expect("missing descriptor");
+                    let dist = descriptor_distance(&d_mp, &d);
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best_idx2 = i2;
                     }
+                }
+
+                if best_dist <= TH_HIGH {
+                    *current_frame.map_points.get_mut(best_idx2).unwrap() = Some(mp.clone());
+                    n_matches += 1;
+
+                    if self.check_orientation {
+                        let kp_lf = if let Some(n_left) = last_frame.n_left {
+                            if i < n_left {
+                                last_frame.keys.get(i).unwrap()
+                            } else {
+                                last_frame
+                                    .keys_right
+                                    .as_ref()
+                                    .expect("missing keys right")
+                                    .get(i - n_left)
+                                    .unwrap()
+                            }
+                        } else {
+                            last_frame
+                                .keys_un
+                                .as_ref()
+                                .expect("missing keys un")
+                                .get(i)
+                                .unwrap()
+                        };
+                        let kp_cf = if let Some(n_left) = current_frame.n_left {
+                            if best_idx2 < n_left {
+                                current_frame.keys.get(best_idx2).unwrap()
+                            } else {
+                                current_frame
+                                    .keys_right
+                                    .as_ref()
+                                    .expect("missing keys right")
+                                    .get(best_idx2 - n_left)
+                                    .unwrap()
+                            }
+                        } else {
+                            current_frame
+                                .keys_un
+                                .as_ref()
+                                .expect("missing keys un")
+                                .get(best_idx2)
+                                .unwrap()
+                        };
+
+                        let mut rot = kp_lf.angle() - kp_cf.angle();
+                        if rot < 0. {
+                            rot += 360.;
+                        }
+                        let mut bin = (rot * factor).round() as usize;
+                        if bin == HISTO_LENGTH {
+                            bin = 0;
+                        }
+                        debug_assert!(bin < HISTO_LENGTH);
+                        rot_hist[bin].push(best_idx2);
+                    }
+                }
+                if let Some(n_left) = current_frame.n_left {
+                    let x_3dr = current_frame.get_relative_pose_trl() * x_3dc;
+                    let x_3dc_point = Point3::from(x_3dr);
+                    let uv = current_frame.camera.project_n(&x_3dc_point);
 
                     let last_octave =
                         if last_frame.n_left.is_none() || i < last_frame.n_left.unwrap() {
@@ -302,7 +420,7 @@ impl OrbMatcher {
                             .octave()
                         };
 
-                    // Search in a window, size depends on scale
+                    // Search in a window. Size depend on scale
                     let radius = th * current_frame.scale_factors[last_octave as usize];
 
                     let indices2 = {
@@ -314,12 +432,8 @@ impl OrbMatcher {
                             (last_octave - 1, last_octave + 1)
                         };
                         current_frame
-                            .get_features_in_area(uv[0], uv[1], radius, min_level, max_level, false)
+                            .get_features_in_area(uv[0], uv[1], radius, min_level, max_level, true)
                     };
-
-                    if indices2.is_empty() {
-                        continue;
-                    }
 
                     let d_mp = mp.get_descriptor();
 
@@ -327,21 +441,14 @@ impl OrbMatcher {
                     let mut best_idx2 = 0;
 
                     for i2 in indices2 {
-                        if let Some(Some(mp)) = current_frame.map_points.get(i2) {
-                            if mp.observations() > 0 {
-                                continue;
-                            }
-                        }
-                        if current_frame.n_left.is_none() && current_frame.u_right[i2] > 0. {
-                            let ur = uv[0] - current_frame.b_fx * inv_zc;
-                            let er = (ur - current_frame.u_right[i2]).abs();
-                            if er > radius {
-                                continue;
-                            }
+                        if let Some(Some(mp)) = current_frame.map_points.get(i2 + n_left)
+                            && mp.observations() > 0
+                        {
+                            continue;
                         }
                         let d = current_frame
                             .descriptors
-                            .row(i2 as i32)
+                            .row((i2 + n_left) as i32)
                             .expect("missing descriptor");
                         let dist = descriptor_distance(&d_mp, &d);
                         if dist < best_dist {
@@ -349,9 +456,11 @@ impl OrbMatcher {
                             best_idx2 = i2;
                         }
                     }
-
                     if best_dist <= TH_HIGH {
-                        *current_frame.map_points.get_mut(best_idx2).unwrap() = Some(mp.clone());
+                        *current_frame
+                            .map_points
+                            .get_mut(best_idx2 + n_left)
+                            .unwrap() = Some(mp.clone());
                         n_matches += 1;
 
                         if self.check_orientation {
@@ -374,25 +483,12 @@ impl OrbMatcher {
                                     .get(i)
                                     .unwrap()
                             };
-                            let kp_cf = if let Some(n_left) = current_frame.n_left {
-                                if best_idx2 < n_left {
-                                    current_frame.keys.get(best_idx2).unwrap()
-                                } else {
-                                    current_frame
-                                        .keys_right
-                                        .as_ref()
-                                        .expect("missing keys right")
-                                        .get(best_idx2 - n_left)
-                                        .unwrap()
-                                }
-                            } else {
-                                current_frame
-                                    .keys_un
-                                    .as_ref()
-                                    .expect("missing keys un")
-                                    .get(best_idx2)
-                                    .unwrap()
-                            };
+                            let kp_cf = current_frame
+                                .keys_right
+                                .as_ref()
+                                .unwrap()
+                                .get(best_idx2)
+                                .unwrap();
 
                             let mut rot = kp_lf.angle() - kp_cf.angle();
                             if rot < 0. {
@@ -403,105 +499,7 @@ impl OrbMatcher {
                                 bin = 0;
                             }
                             debug_assert!(bin < HISTO_LENGTH);
-                            rot_hist[bin].push(best_idx2);
-                        }
-                    }
-                    if let Some(n_left) = current_frame.n_left {
-                        let x_3dr = current_frame.get_relative_pose_trl() * x_3dc;
-                        let x_3dc_point = Point3::from(x_3dr);
-                        let uv = current_frame.camera.project_n(&x_3dc_point);
-
-                        let last_octave =
-                            if last_frame.n_left.is_none() || i < last_frame.n_left.unwrap() {
-                                last_frame.keys[i].octave()
-                            } else {
-                                last_frame.keys_right.as_ref().expect("missing keys")
-                                    [i - last_frame.n_left.expect("missing n left")]
-                                .octave()
-                            };
-
-                        // Search in a window. Size depend on scale
-                        let radius = th * current_frame.scale_factors[last_octave as usize];
-
-                        let indices2 = {
-                            let (min_level, max_level) = if forward {
-                                (last_octave, -1)
-                            } else if backward {
-                                (0, last_octave)
-                            } else {
-                                (last_octave - 1, last_octave + 1)
-                            };
-                            current_frame.get_features_in_area(
-                                uv[0], uv[1], radius, min_level, max_level, true,
-                            )
-                        };
-
-                        let d_mp = mp.get_descriptor();
-
-                        let mut best_dist = 256;
-                        let mut best_idx2 = 0;
-
-                        for i2 in indices2 {
-                            if let Some(Some(mp)) = current_frame.map_points.get(i2 + n_left) {
-                                if mp.observations() > 0 {
-                                    continue;
-                                }
-                            }
-                            let d = current_frame
-                                .descriptors
-                                .row((i2 + n_left) as i32)
-                                .expect("missing descriptor");
-                            let dist = descriptor_distance(&d_mp, &d);
-                            if dist < best_dist {
-                                best_dist = dist;
-                                best_idx2 = i2;
-                            }
-                        }
-                        if best_dist <= TH_HIGH {
-                            *current_frame
-                                .map_points
-                                .get_mut(best_idx2 + n_left)
-                                .unwrap() = Some(mp.clone());
-                            n_matches += 1;
-
-                            if self.check_orientation {
-                                let kp_lf = if let Some(n_left) = last_frame.n_left {
-                                    if i < n_left {
-                                        last_frame.keys.get(i).unwrap()
-                                    } else {
-                                        last_frame
-                                            .keys_right
-                                            .as_ref()
-                                            .expect("missing keys right")
-                                            .get(i - n_left)
-                                            .unwrap()
-                                    }
-                                } else {
-                                    last_frame
-                                        .keys_un
-                                        .as_ref()
-                                        .expect("missing keys un")
-                                        .get(i)
-                                        .unwrap()
-                                };
-                                let kp_cf = current_frame
-                                    .keys_right
-                                    .as_ref()
-                                    .unwrap()
-                                    .get(best_idx2)
-                                    .unwrap();
-
-                                let mut rot = kp_lf.angle() - kp_cf.angle();
-                                if rot < 0. {
-                                    rot += 360.;
-                                }
-                                let mut bin = (rot * factor).round() as usize;
-                                if bin == HISTO_LENGTH {
-                                    bin = 0;
-                                }
-                                debug_assert!(bin < HISTO_LENGTH);
-                                rot_hist[bin].push(best_idx2 + n_left);
-                            }
+                            rot_hist[bin].push(best_idx2 + n_left);
                         }
                     }
                 }
@@ -1298,30 +1296,28 @@ impl OrbMatcher {
                 }
             }
 
-            if best_dist <= TH_LOW {
-                if (best_dist as f32) < best_dist2 as f32 * self.nn_ratio {
-                    if matches21[best_idx2 as usize] >= 0 {
-                        matches12[matches21[best_idx2 as usize] as usize] = -1;
-                        n_matches -= 1;
-                    }
-                    matches12[i1] = best_idx2;
-                    matches21[best_idx2 as usize] = i1 as i32;
-                    matched_distance[best_idx2 as usize] = best_dist;
-                    n_matches += 1;
+            if best_dist <= TH_LOW && (best_dist as f32) < best_dist2 as f32 * self.nn_ratio {
+                if matches21[best_idx2 as usize] >= 0 {
+                    matches12[matches21[best_idx2 as usize] as usize] = -1;
+                    n_matches -= 1;
+                }
+                matches12[i1] = best_idx2;
+                matches21[best_idx2 as usize] = i1 as i32;
+                matched_distance[best_idx2 as usize] = best_dist;
+                n_matches += 1;
 
-                    if self.check_orientation {
-                        let mut rot = f1.keys_un.as_ref().unwrap()[i1].angle()
-                            - f2.keys_un.as_ref().unwrap()[best_idx2 as usize].angle();
-                        if rot < 0. {
-                            rot += 360.;
-                        }
-                        let mut bin = (rot * factor).round() as usize;
-                        if bin == HISTO_LENGTH {
-                            bin = 0;
-                        }
-                        debug_assert!(bin < HISTO_LENGTH);
-                        rot_hist[bin].push(i1);
+                if self.check_orientation {
+                    let mut rot = f1.keys_un.as_ref().unwrap()[i1].angle()
+                        - f2.keys_un.as_ref().unwrap()[best_idx2 as usize].angle();
+                    if rot < 0. {
+                        rot += 360.;
                     }
+                    let mut bin = (rot * factor).round() as usize;
+                    if bin == HISTO_LENGTH {
+                        bin = 0;
+                    }
+                    debug_assert!(bin < HISTO_LENGTH);
+                    rot_hist[bin].push(i1);
                 }
             }
         }
@@ -1410,7 +1406,7 @@ impl OrbMatcher {
         let map_points2 = kf2.get_map_point_matches();
 
         let mut n_matches = 0;
-        let mut matches12 = vec![-1i32; kf1.n as usize];
+        let mut matches12 = vec![-1i32; kf1.n];
 
         let mut rot_hist: [Vec<usize>; HISTO_LENGTH] =
             std::array::from_fn(|_| Vec::with_capacity(500));

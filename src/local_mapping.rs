@@ -325,15 +325,16 @@ impl LocalMapping {
                                         current_keyframe.timestamp - previous_kf.timestamp;
                                 }
 
-                                if !map.get_inertial_ba2() {
-                                    if self.imu_init.lock().unwrap().t_init < 10. && dist < 0.02 {
-                                        info!("Not enough motion for initializing. Resetting...");
-                                        {
-                                            let mut reset = self.reset.lock().unwrap();
-                                            reset.reset_requested_active_map = true;
-                                            reset.map_to_reset = Some(map.clone());
-                                            self.bad_imu.store(true, Ordering::SeqCst);
-                                        }
+                                if !map.get_inertial_ba2()
+                                    && self.imu_init.lock().unwrap().t_init < 10.
+                                    && dist < 0.02
+                                {
+                                    info!("Not enough motion for initializing. Resetting...");
+                                    {
+                                        let mut reset = self.reset.lock().unwrap();
+                                        reset.reset_requested_active_map = true;
+                                        reset.map_to_reset = Some(map.clone());
+                                        self.bad_imu.store(true, Ordering::SeqCst);
                                     }
                                 }
 
@@ -355,14 +356,14 @@ impl LocalMapping {
                             } else {
                                 None
                             }
-                        } else if let Some(map) = current_keyframe.get_map() {
-                            Some(optimizer::local_bundle_adjustment(
-                                &current_keyframe,
-                                Some(self.abort_ba.clone()),
-                                &map,
-                            ))
                         } else {
-                            None
+                            current_keyframe.get_map().map(|map| {
+                                optimizer::local_bundle_adjustment(
+                                    &current_keyframe,
+                                    Some(self.abort_ba.clone()),
+                                    &map,
+                                )
+                            })
                         };
                         #[cfg(feature = "register-times")]
                         if let Some(result) = result {

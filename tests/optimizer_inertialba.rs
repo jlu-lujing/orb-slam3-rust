@@ -167,7 +167,7 @@ fn inertial_ba_matches_g2o() {
     let (states, pts) = (res.states, res.points);
 
     for (i, (g, r)) in states.iter().zip(ref_states.iter()).enumerate() {
-        let dr = (g.rwb.transpose() * r.rwb).into();
+        let dr = g.rwb.transpose() * r.rwb;
         assert!(log_so3(&dr).norm() < 1e-5, "KF {i} rotation differs");
         assert!((g.twb - r.twb).norm() < 1e-5, "KF {i} translation differs");
         assert!((g.vel - r.vel).norm() < 1e-5, "KF {i} velocity differs");

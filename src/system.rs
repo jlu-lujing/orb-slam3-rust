@@ -354,6 +354,20 @@ impl System {
             .store(false, Ordering::SeqCst);
     }
 
+    #[cfg(feature = "tracker-pause-resume")]
+    pub fn pause_tracking(&self) {
+        if let Some(tracking) = self.tracking.get() {
+            tracking.lock().unwrap().request_stop();
+        }
+    }
+
+    #[cfg(feature = "tracker-pause-resume")]
+    pub fn resume_tracking(&self) {
+        if let Some(tracking) = self.tracking.get() {
+            tracking.lock().unwrap().release();
+        }
+    }
+
     pub fn deactivate_localization_mode(&self) {
         if let Some(mapping) = self.local_mapping.get() {
             mapping.release();

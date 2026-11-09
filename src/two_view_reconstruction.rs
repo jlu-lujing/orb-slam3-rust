@@ -67,8 +67,8 @@ impl TwoViewReconstruction {
             keys2: Vec::new(),
             matches12: Vec::new(),
             matched1: Vec::new(),
-            k: k,
-            sigma: sigma,
+            k,
+            sigma,
             sigma2: sigma * sigma,
             max_iterations: iterations,
             sets: Vec::new(),
@@ -149,7 +149,7 @@ impl TwoViewReconstruction {
         // Motion and structure from motion in a piecewice planar environment
         // International Journal of Pattern Recognition nad Artificial Intelligence, 1988
         let k_inv = &self.k.try_inverse().unwrap();
-        let a = k_inv * result.h21 * &self.k;
+        let a = k_inv * result.h21 * self.k;
 
         let svd = a.svd(true, true);
         let u = svd.u.unwrap();
@@ -346,14 +346,13 @@ impl TwoViewReconstruction {
         if let Some((chosen, r, t)) = hypotheses
             .iter()
             .find(|(res, _, _)| res.num_good == max_good)
+            && chosen.parallax > min_parallax
         {
-            if chosen.parallax > min_parallax {
-                return Some(ReconstructResult {
-                    t21: pose_from_rt(r, t),
-                    triangulated: chosen.good.clone(),
-                    p3d: chosen.p3d.clone(),
-                });
-            }
+            return Some(ReconstructResult {
+                t21: pose_from_rt(r, t),
+                triangulated: chosen.good.clone(),
+                p3d: chosen.p3d.clone(),
+            });
         }
 
         None
@@ -369,8 +368,8 @@ fn normalize(keys: &[KeyPoint]) -> (Vec<Point2f>, Matrix3<f32>) {
         mean_x += it.pt().x;
         mean_y += it.pt().y;
     }
-    mean_x = mean_x / n as f32;
-    mean_y = mean_y / n as f32;
+    mean_x /= n as f32;
+    mean_y /= n as f32;
 
     let (mut mean_dev_x, mut mean_dev_y) = (0.0f32, 0.0f32);
     for i in 0..n {
@@ -379,8 +378,8 @@ fn normalize(keys: &[KeyPoint]) -> (Vec<Point2f>, Matrix3<f32>) {
         mean_dev_y += p.y.abs();
         normalized_points.push(p);
     }
-    mean_dev_x = mean_dev_x / n as f32;
-    mean_dev_y = mean_dev_y / n as f32;
+    mean_dev_x /= n as f32;
+    mean_dev_y /= n as f32;
 
     // Guard against degenerate (collinear) point sets where all coordinates
     // along one axis are identical, producing zero mean deviation. Without
@@ -396,8 +395,8 @@ fn normalize(keys: &[KeyPoint]) -> (Vec<Point2f>, Matrix3<f32>) {
     let s_x = 1.0 / mean_dev_x;
     let s_y = 1.0 / mean_dev_y;
     for it in normalized_points.iter_mut() {
-        it.x = it.x * s_x;
-        it.y = it.y * s_y;
+        it.x *= s_x;
+        it.y *= s_y;
     }
 
     let mut t = Matrix3::<f32>::zeros();
@@ -765,14 +764,14 @@ fn check_rt(
 
     // camera 1 projection matrix k[I|0]
     let mut p1 = SMatrix::<f32, 3, 4>::zeros();
-    p1.fixed_view_mut::<3, 3>(0, 0).copy_from(&k);
+    p1.fixed_view_mut::<3, 3>(0, 0).copy_from(k);
 
     let o1 = Vector3::<f32>::zeros();
 
     // camera 2 projection matrix k[R|t]
     let mut p2 = SMatrix::<f32, 3, 4>::zeros();
-    p2.fixed_view_mut::<3, 3>(0, 0).copy_from(&r);
-    p2.fixed_view_mut::<3, 1>(0, 3).copy_from(&t);
+    p2.fixed_view_mut::<3, 3>(0, 0).copy_from(r);
+    p2.fixed_view_mut::<3, 1>(0, 3).copy_from(t);
     p2 = k * p2;
 
     let o2 = -r.transpose() * t;
@@ -867,7 +866,7 @@ fn decompose_e(e: &Matrix3<f32>) -> (Matrix3<f32>, Matrix3<f32>, Vector3<f32>) {
     let u = svd.u.expect("SVD requested U but none was returned");
     let v_t = svd.v_t.expect("SVD requested V^T but none was returned");
 
-    let mut t = u.column(2).into_owned().normalize();
+    let t = u.column(2).into_owned().normalize();
 
     let w = Matrix3::new(0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0);
 

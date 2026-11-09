@@ -125,7 +125,7 @@ fn inertial_optimization_gs_matches_g2o() {
     let (rwg, scale) =
         inertial_optimization_gs_core(&kfs, front_gyro, front_acc, rwg_init, scale_init);
 
-    let dr = (rwg.transpose() * ref_rwg).into();
+    let dr = rwg.transpose() * ref_rwg;
     let ang = orb_slam3_rs::g2o_core::log_so3(&dr).norm();
     assert!(ang < 1e-5, "Rwg differs by {ang} rad");
     assert!(

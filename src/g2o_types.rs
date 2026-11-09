@@ -9,9 +9,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use nalgebra::{
-    DMatrix, DVector, Matrix2, Matrix3, Point3, SMatrix, SVector, SymmetricEigen, Vector2, Vector3,
-};
+use nalgebra::{DMatrix, DVector, Matrix3, SMatrix, SVector, SymmetricEigen, Vector2, Vector3};
 
 use crate::camera_models::GeometricCamera;
 use crate::g2o_core::{
@@ -19,7 +17,6 @@ use crate::g2o_core::{
     normalize_rotation, right_jacobian_so3, skew,
 };
 use crate::imu_types::{Bias, Preintegrated};
-use crate::optimizable_types::VertexSBAPointXYZ;
 
 const GRAVITY_VALUE: f64 = 9.81;
 

@@ -71,7 +71,7 @@ fn essential_graph_4dof_matches_g2o() {
     let out = optimize_essential_graph_4dof_core(&verts, &edges, 20);
 
     for (i, ((rg, tg), (re, te))) in out.iter().zip(ref_out.iter()).enumerate() {
-        let dr = (rg.transpose() * re).into();
+        let dr = rg.transpose() * re;
         assert!(
             log_so3(&dr).norm() < 1e-5,
             "KF {i} rotation differs by {}",

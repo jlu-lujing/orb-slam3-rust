@@ -117,6 +117,13 @@ impl LoopClosing {
                     break;
                 }
             }
+            for candidate in candidates.merge {
+                if let Some(merge_kf) = view.key_frames.get(&candidate).cloned()
+                    && self.detect_and_merge(&current, &merge_kf)
+                {
+                    break;
+                }
+            }
         }
     }
 
@@ -170,6 +177,89 @@ impl LoopClosing {
         );
         self.correct_loop(current, candidate, sim3);
         true
+    }
+
+    fn detect_and_merge(&self, current: &Arc<KeyFrame>, candidate: &Arc<KeyFrame>) -> bool {
+        let Some(detected) = self.detect_sim3(current, candidate) else {
+            return false;
+        };
+        self.merge_maps(current, candidate, detected);
+        true
+    }
+
+    fn detect_sim3(&self, current: &Arc<KeyFrame>, candidate: &Arc<KeyFrame>) -> Option<Sim3> {
+        let pose = current.get_pose();
+        let current_sim_f32 =
+            nalgebra::Similarity3::from_parts(pose.translation, pose.rotation, 1.0_f32);
+        let mut sim3 = Sim3::new(
+            pose.rotation.cast::<f64>(),
+            pose.translation.vector.cast::<f64>(),
+            1.0,
+        );
+        let points: Vec<_> = candidate.get_map_points().into_iter().collect();
+        let mut matches = vec![None; current.n];
+        let matcher = OrbMatcher::new(0.75, true);
+        if matcher.search_by_projection_similarity_loop_detection(
+            current,
+            &current_sim_f32,
+            &points,
+            &mut matches,
+            8.0,
+            0.75,
+        ) < 20
+        {
+            return None;
+        }
+        let inliers = optimizer::optimize_sim3(
+            current,
+            candidate,
+            &mut matches,
+            &mut sim3,
+            10.0,
+            self.fix_scale,
+            true,
+        );
+        (inliers >= 20).then_some(sim3)
+    }
+
+    fn merge_maps(&self, current: &Arc<KeyFrame>, candidate: &Arc<KeyFrame>, sim3: Sim3) {
+        let (Some(source), Some(target)) = (current.get_map(), candidate.get_map()) else {
+            return;
+        };
+        if source.get_id() == target.get_id() {
+            return;
+        }
+        self.running_loop.store(true, Ordering::SeqCst);
+        if let Some(mapping) = self.local_mapping.get().and_then(Weak::upgrade) {
+            mapping.request_stop();
+            mapping.empty_queue();
+        }
+
+        let transform = nalgebra::Isometry3::from_parts(
+            nalgebra::Translation3::from(sim3.translation().cast::<f32>()),
+            sim3.rotation().cast::<f32>(),
+        );
+        source.apply_scaled_rotation(transform, sim3.scale() as f32, true);
+        let (keyframes, points) = source.take_contents();
+        for keyframe in keyframes {
+            keyframe.update_map(target.clone());
+            target.add_key_frame(keyframe);
+        }
+        for point in points {
+            point.update_map(target.clone());
+            target.add_map_point(point);
+        }
+        self.atlas.set_current_map(target.clone());
+        self.atlas.set_map_bad(source);
+        target.increase_change_index();
+
+        for keyframe in target.get_all_key_frames() {
+            keyframe.update_connections();
+        }
+        if let Some(mapping) = self.local_mapping.get().and_then(Weak::upgrade) {
+            mapping.release();
+        }
+        self.running_loop.store(false, Ordering::SeqCst);
     }
 
     fn correct_loop(&self, current: &Arc<KeyFrame>, candidate: &Arc<KeyFrame>, sim3: Sim3) {

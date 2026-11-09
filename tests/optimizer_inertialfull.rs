@@ -135,7 +135,7 @@ fn inertial_optimization_full_matches_g2o() {
     };
     let r = inertial_optimization_core(&kfs, front_gyro, front_acc, rwg_init, scale_init, &cfg);
 
-    let dr = (r.rwg.transpose() * ref_rwg).into();
+    let dr = r.rwg.transpose() * ref_rwg;
     assert!(
         orb_slam3_rs::g2o_core::log_so3(&dr).norm() < 1e-5,
         "Rwg differs"

@@ -609,6 +609,19 @@ impl Map {
         drop(inner);
         self.key_frame_origins.write().unwrap().clear();
     }
+
+    pub(crate) fn take_contents(&self) -> (Vec<Arc<KeyFrame>>, Vec<Arc<MapPoint>>) {
+        let mut inner = self.inner.write().unwrap();
+        let keyframes = inner.key_frames.values().cloned().collect();
+        let points = inner.map_points.values().cloned().collect();
+        inner.key_frames.clear();
+        inner.map_points.clear();
+        inner.kf_initial = None;
+        inner.kf_lower = None;
+        drop(inner);
+        self.key_frame_origins.write().unwrap().clear();
+        (keyframes, points)
+    }
 }
 
 #[cfg(test)]

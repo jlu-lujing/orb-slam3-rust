@@ -350,6 +350,16 @@ impl Atlas {
         }
     }
 
+    pub fn set_current_map(&self, map: Arc<Map>) {
+        let mut inner = self.inner.lock().unwrap();
+        map.set_current_map();
+        inner
+            .maps
+            .entry(map.get_id())
+            .or_insert_with(|| map.clone());
+        inner.current_map = Some(map);
+    }
+
     pub fn set_map_bad(&self, map: Arc<Map>) {
         let id = map.get_id();
         let mut inner = self.inner.lock().unwrap();

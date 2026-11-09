@@ -1,21 +1,24 @@
-use nalgebra::{Matrix3x4, Matrix4, Vector3};
+use nalgebra::{Matrix3, Matrix3x4, Matrix4, Vector3};
 
-// TODO
-/*pub fn compute_f12() -> Matrix3<f32> {
-    let r1c2 = r1w * r2w.transpose();
-    let t1c2 = -r1c2 * t2w + t1w;
+use crate::key_frame::KeyFrame;
 
-    // Skew-symmetric matrix of t1c2
-    // `Rotation3::hat` is only available for `f64` in sophus (`IsScalar`); promote, then cast back.
-    let omega = VecF64::<3>::from_array([t1c2[0] as f64, t1c2[1] as f64, t1c2[2] as f64]);
-    let t1c2x = Rotation3F64::hat(omega).map(|v| v as f32);
+/// Computes the fundamental matrix relating camera 1 to camera 2.
+pub fn compute_f12(kf1: &KeyFrame, kf2: &KeyFrame) -> Matrix3<f32> {
+    let r1c2 = kf1.get_rotation() * kf2.get_rotation().transpose();
+    let t1c2 = -r1c2 * kf2.get_camera_center() + kf1.get_camera_center();
+    let t1c2_skew = t1c2.cross_matrix();
 
-    // K is an upper triangular matrix with fx, fy > 0, so it is always invertible for a valid camera.
-    let k1_inv = k1.try_inverse().expect("K1 must be invertible");
-    let k2_inv = k2.try_inverse().expect("K2 must be invertible");
-
-    k1_inv.transpose() * t1c2x * r1c2 * k2_inv
-}*/
+    kf1.k_matrix
+        .try_inverse()
+        .expect("valid camera 1 intrinsics")
+        .transpose()
+        * t1c2_skew
+        * r1c2
+        * kf2
+            .k_matrix
+            .try_inverse()
+            .expect("valid camera 2 intrinsics")
+}
 
 /// Triangulates a 3D point from two 2D points in normalized/pixel coordinates.
 /// `x_c1`, `x_c2`: 2D points in camera 1 and 2 (can be pixel or normalized, depending on tc1w/tc2w).

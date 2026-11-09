@@ -72,7 +72,7 @@ impl GeometricCamera for Pinhole {
     }
 
     fn uncertainty(&self, _p2d: &nalgebra::Matrix2x1<f64>) -> f32 {
-        return 1.0;
+        1.0
     }
 
     fn unproject(&self, p2d: &Point2f) -> Point3f {

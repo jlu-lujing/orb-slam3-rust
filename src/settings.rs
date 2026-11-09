@@ -160,7 +160,7 @@ impl Settings {
         // Open settings file
         let settings = FileStorage::new_def(&config_file.to_string_lossy(), FileStorage_READ)
             .map_err(|_| SettingsError::InvalidFile)?;
-        if let Err(_) = settings.is_opened() {
+        if settings.is_opened().is_err() {
             return Err(SettingsError::InvalidFile);
         }
         info!("Load settings from {}", config_file.to_string_lossy());
@@ -336,7 +336,7 @@ impl Settings {
                 &mut p1,
                 &mut p2,
                 &mut q,
-                CALIB_ZERO_DISPARITY.into(),
+                CALIB_ZERO_DISPARITY,
                 -1.,
                 new_im_size,
                 &mut valid_roi1,
@@ -405,33 +405,32 @@ impl Settings {
                     .map_err(|_| SettingsError::Rectification)? as f32);
 
             // Rectification rotates the left camera frame; propagate that into T_bc.
-            if matches!(sensor, Sensor::IMUStereo) {
-                if let Some(ref mut imu_info) = imu {
-                    let get = |row: i32, col: i32| -> Result<f32, SettingsError> {
-                        r_r1_u1
-                            .at_2d::<f64>(row, col)
-                            .map(|v| *v as f32)
-                            .map_err(|_| SettingsError::Rectification)
-                    };
-                    let r_val = Matrix3::new(
-                        get(0, 0)?,
-                        get(0, 1)?,
-                        get(0, 2)?,
-                        get(1, 0)?,
-                        get(1, 1)?,
-                        get(1, 2)?,
-                        get(2, 0)?,
-                        get(2, 1)?,
-                        get(2, 2)?,
-                    );
-                    // from_matrix_unchecked is safe: R_r1_u1 is an orthonormal rotation
-                    // output from stereoRectify.
-                    let rotation = UnitQuaternion::from_rotation_matrix(
-                        &Rotation3::from_matrix_unchecked(r_val),
-                    );
-                    let t_r1_u1 = Isometry3::from_parts(Translation3::identity(), rotation);
-                    imu_info.tbc = imu_info.tbc * t_r1_u1.inverse();
-                }
+            if matches!(sensor, Sensor::IMUStereo)
+                && let Some(ref mut imu_info) = imu
+            {
+                let get = |row: i32, col: i32| -> Result<f32, SettingsError> {
+                    r_r1_u1
+                        .at_2d::<f64>(row, col)
+                        .map(|v| *v as f32)
+                        .map_err(|_| SettingsError::Rectification)
+                };
+                let r_val = Matrix3::new(
+                    get(0, 0)?,
+                    get(0, 1)?,
+                    get(0, 2)?,
+                    get(1, 0)?,
+                    get(1, 1)?,
+                    get(1, 2)?,
+                    get(2, 0)?,
+                    get(2, 1)?,
+                    get(2, 2)?,
+                );
+                // from_matrix_unchecked is safe: R_r1_u1 is an orthonormal rotation
+                // output from stereoRectify.
+                let rotation =
+                    UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix_unchecked(r_val));
+                let t_r1_u1 = Isometry3::from_parts(Translation3::identity(), rotation);
+                imu_info.tbc *= t_r1_u1.inverse();
             }
 
             stereo = Some(StereoInfo {
@@ -597,7 +596,7 @@ impl Settings {
             original_cols.try_into().expect("size overflow"),
             original_rows.try_into().expect("size overflow"),
         );
-        let mut new_size = original_size.clone();
+        let mut new_size = original_size;
         let mut need_to_resize = false;
 
         let new_height = read_param_int(storage, "Camera.newHeight");
@@ -634,17 +633,16 @@ impl Settings {
                     let p2 = camera.calibration.get_parameter(2) * scale_factor;
                     camera.calibration_mut().set_parameter(p0, 0);
                     camera.calibration_mut().set_parameter(p2, 2);
-                    if *camera_type == CameraType::KannalaBrandt {
-                        if let Some(kanalla) = camera
+                    if *camera_type == CameraType::KannalaBrandt
+                        && let Some(kanalla) = camera
                             .calibration_mut()
                             .as_any_mut()
                             .downcast_mut::<KannalaBrandt8>()
-                        {
-                            kanalla.lapping_area[0] =
-                                (kanalla.lapping_area[0] as f32 * scale_factor) as usize;
-                            kanalla.lapping_area[1] =
-                                (kanalla.lapping_area[1] as f32 * scale_factor) as usize;
-                        }
+                    {
+                        kanalla.lapping_area[0] =
+                            (kanalla.lapping_area[0] as f32 * scale_factor) as usize;
+                        kanalla.lapping_area[1] =
+                            (kanalla.lapping_area[1] as f32 * scale_factor) as usize;
                     }
                 }
                 if let Some(camera) = camera2 {
@@ -652,17 +650,16 @@ impl Settings {
                     let p2 = camera.calibration.get_parameter(2) * scale_factor;
                     camera.calibration_mut().set_parameter(p0, 0);
                     camera.calibration_mut().set_parameter(p2, 2);
-                    if *camera_type == CameraType::KannalaBrandt {
-                        if let Some(kanalla) = camera
+                    if *camera_type == CameraType::KannalaBrandt
+                        && let Some(kanalla) = camera
                             .calibration_mut()
                             .as_any_mut()
                             .downcast_mut::<KannalaBrandt8>()
-                        {
-                            kanalla.lapping_area[0] =
-                                (kanalla.lapping_area[0] as f32 * scale_factor) as usize;
-                            kanalla.lapping_area[1] =
-                                (kanalla.lapping_area[1] as f32 * scale_factor) as usize;
-                        }
+                    {
+                        kanalla.lapping_area[0] =
+                            (kanalla.lapping_area[0] as f32 * scale_factor) as usize;
+                        kanalla.lapping_area[1] =
+                            (kanalla.lapping_area[1] as f32 * scale_factor) as usize;
                     }
                 }
             }
@@ -696,7 +693,7 @@ impl Settings {
             gyro_walk: read_param_float(storage, "IMU.GyroWalk").unwrap_or(1.9393e-05),
             acc_walk: read_param_float(storage, "IMU.AccWalk").unwrap_or(3.0e-03),
             imu_frequency: read_param_float(storage, "IMU.Frequency").unwrap_or(200.0),
-            tbc: tbc,
+            tbc,
             insert_kfs_when_lost: read_param_bool(storage, "IMU.InsertKFsWhenLost").unwrap_or(true),
         }
     }

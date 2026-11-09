@@ -323,10 +323,8 @@ impl KeyFrameDatabase {
                         out.loop_.push(kf);
                     }
                 }
-                Some(m) if !view.is_map_bad(m) => {
-                    if out.merge.len() < n {
-                        out.merge.push(kf);
-                    }
+                Some(m) if !view.is_map_bad(m) && out.merge.len() < n => {
+                    out.merge.push(kf);
                 }
                 _ => {}
             }

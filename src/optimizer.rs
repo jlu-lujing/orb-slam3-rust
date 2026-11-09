@@ -438,20 +438,21 @@ pub fn bundle_adjustment(
             // Right-camera (fisheye rig) observation.
             if let Some(cam2) = &kf.camera2 {
                 let right = right as i64;
-                if let Some(keys_right) = &kf.keys_right {
-                    if right != -1 && (right as usize) < keys_right.len() {
-                        let n_left = kf.n_left.unwrap_or(0) as i64;
-                        let kp = &keys_right[(right - n_left) as usize];
-                        let inv_sigma2 = kf.inv_level_sigma2[kp.octave() as usize] as f64;
-                        let m_trl = SE3Quat::from_isometry_f32(&kf.get_relative_pose_trl());
-                        let mut e = EdgeSE3ProjectXYZToBody::new(mp_vi, kf_vi, cam2.clone(), m_trl);
-                        e.set_measurement(Vector2::new(kp.pt().x as f64, kp.pt().y as f64));
-                        e.set_information(Matrix2::identity() * inv_sigma2);
-                        if robust {
-                            e.set_robust_kernel(Some(th_huber_2d));
-                        }
-                        optimizer.add_edge(Box::new(e));
+                if let Some(keys_right) = &kf.keys_right
+                    && right != -1
+                    && (right as usize) < keys_right.len()
+                {
+                    let n_left = kf.n_left.unwrap_or(0) as i64;
+                    let kp = &keys_right[(right - n_left) as usize];
+                    let inv_sigma2 = kf.inv_level_sigma2[kp.octave() as usize] as f64;
+                    let m_trl = SE3Quat::from_isometry_f32(&kf.get_relative_pose_trl());
+                    let mut e = EdgeSE3ProjectXYZToBody::new(mp_vi, kf_vi, cam2.clone(), m_trl);
+                    e.set_measurement(Vector2::new(kp.pt().x as f64, kp.pt().y as f64));
+                    e.set_information(Matrix2::identity() * inv_sigma2);
+                    if robust {
+                        e.set_robust_kernel(Some(th_huber_2d));
                     }
+                    optimizer.add_edge(Box::new(e));
                 }
             }
         }
@@ -667,24 +668,24 @@ pub fn local_bundle_adjustment(
 
             if let Some(cam2) = &obs_kf.camera2 {
                 let right = right as i64;
-                if right != -1 {
-                    if let Some(keys_right) = &obs_kf.keys_right {
-                        let n_left = obs_kf.n_left.unwrap_or(0) as i64;
-                        let kp = &keys_right[(right - n_left) as usize];
-                        let inv_sigma2 = obs_kf.inv_level_sigma2[kp.octave() as usize] as f64;
-                        let m_trl = SE3Quat::from_isometry_f32(&obs_kf.get_relative_pose_trl());
-                        let mut e = EdgeSE3ProjectXYZToBody::new(mp_vi, kf_vi, cam2.clone(), m_trl);
-                        e.set_measurement(Vector2::new(kp.pt().x as f64, kp.pt().y as f64));
-                        e.set_information(Matrix2::identity() * inv_sigma2);
-                        e.set_robust_kernel(Some(th_huber_mono));
-                        let ei = optimizer.add_edge(Box::new(e));
-                        recs.push(Rec {
-                            ei,
-                            thr: CHI2_MONO,
-                            kf: obs_kf.clone(),
-                            mp: mp.clone(),
-                        });
-                    }
+                if right != -1
+                    && let Some(keys_right) = &obs_kf.keys_right
+                {
+                    let n_left = obs_kf.n_left.unwrap_or(0) as i64;
+                    let kp = &keys_right[(right - n_left) as usize];
+                    let inv_sigma2 = obs_kf.inv_level_sigma2[kp.octave() as usize] as f64;
+                    let m_trl = SE3Quat::from_isometry_f32(&obs_kf.get_relative_pose_trl());
+                    let mut e = EdgeSE3ProjectXYZToBody::new(mp_vi, kf_vi, cam2.clone(), m_trl);
+                    e.set_measurement(Vector2::new(kp.pt().x as f64, kp.pt().y as f64));
+                    e.set_information(Matrix2::identity() * inv_sigma2);
+                    e.set_robust_kernel(Some(th_huber_mono));
+                    let ei = optimizer.add_edge(Box::new(e));
+                    recs.push(Rec {
+                        ei,
+                        thr: CHI2_MONO,
+                        kf: obs_kf.clone(),
+                        mp: mp.clone(),
+                    });
                 }
             }
         }
@@ -2537,7 +2538,7 @@ pub fn inertial_ba_core(
         let mut vp = VertexPose::new(imu_cam_pose_full(
             kf.state.rwb,
             kf.state.twb,
-            &[kf.camera.clone()],
+            std::slice::from_ref(&kf.camera),
             &[kf.rbc],
             &[kf.tbc],
             kf.bf,
@@ -3217,18 +3218,18 @@ pub fn optimize_essential_graph_4dof(
     }
     for (i, kf) in kfs.iter().enumerate() {
         let si = siw_for(kf);
-        if let Some(parent) = kf.get_parent() {
-            if let Some(&j) = idx.get(&parent.id) {
-                let (drij, dtij) = rel(&siw_for(&parent), &si);
-                edges.push(Edge4DoFConstraint { i, j, drij, dtij });
-            }
+        if let Some(parent) = kf.get_parent()
+            && let Some(&j) = idx.get(&parent.id)
+        {
+            let (drij, dtij) = rel(&siw_for(&parent), &si);
+            edges.push(Edge4DoFConstraint { i, j, drij, dtij });
         }
         for lkf in kf.get_loop_edges() {
-            if lkf.id < kf.id {
-                if let Some(&j) = idx.get(&lkf.id) {
-                    let (drij, dtij) = rel(&siw_for(&lkf), &si);
-                    edges.push(Edge4DoFConstraint { i, j, drij, dtij });
-                }
+            if lkf.id < kf.id
+                && let Some(&j) = idx.get(&lkf.id)
+            {
+                let (drij, dtij) = rel(&siw_for(&lkf), &si);
+                edges.push(Edge4DoFConstraint { i, j, drij, dtij });
             }
         }
         for nkf in kf.get_covisibles_by_weight(MIN_FEAT) {
@@ -3321,10 +3322,11 @@ pub fn merge_inertial_ba(
     // Fixed boundary: the predecessor of each window's last keyframe.
     let mut fixed: Vec<Arc<KeyFrame>> = Vec::new();
     for w in [&window, &merge_window] {
-        if let Some(b) = w.last().and_then(|k| k.get_prev_kf()) {
-            if !seen.contains(&b.id) && seen.insert(b.id) {
-                fixed.push(b);
-            }
+        if let Some(b) = w.last().and_then(|k| k.get_prev_kf())
+            && !seen.contains(&b.id)
+            && seen.insert(b.id)
+        {
+            fixed.push(b);
         }
     }
 
@@ -3541,26 +3543,26 @@ pub fn optimize_essential_graph(
     for (i, kf) in kfs.iter().enumerate() {
         let swi = siw_for(kf).inverse();
 
-        if let Some(parent) = kf.get_parent() {
-            if let Some(&j) = idx.get(&parent.id) {
-                let sjw = siw_for(&parent);
+        if let Some(parent) = kf.get_parent()
+            && let Some(&j) = idx.get(&parent.id)
+        {
+            let sjw = siw_for(&parent);
+            edges.push(EssentialGraphEdge {
+                i,
+                j,
+                sji: sjw.mul(&swi),
+            });
+        }
+        for lkf in kf.get_loop_edges() {
+            if lkf.id < kf.id
+                && let Some(&j) = idx.get(&lkf.id)
+            {
+                let slw = siw_for(&lkf);
                 edges.push(EssentialGraphEdge {
                     i,
                     j,
-                    sji: sjw.mul(&swi),
+                    sji: slw.mul(&swi),
                 });
-            }
-        }
-        for lkf in kf.get_loop_edges() {
-            if lkf.id < kf.id {
-                if let Some(&j) = idx.get(&lkf.id) {
-                    let slw = siw_for(&lkf);
-                    edges.push(EssentialGraphEdge {
-                        i,
-                        j,
-                        sji: slw.mul(&swi),
-                    });
-                }
             }
         }
         for nkf in kf.get_covisibles_by_weight(MIN_FEAT) {
@@ -3580,17 +3582,16 @@ pub fn optimize_essential_graph(
                 });
             }
         }
-        if kf.is_inertial() {
-            if let Some(prev) = kf.get_prev_kf() {
-                if let Some(&j) = idx.get(&prev.id) {
-                    let spw = siw_for(&prev);
-                    edges.push(EssentialGraphEdge {
-                        i,
-                        j,
-                        sji: spw.mul(&swi),
-                    });
-                }
-            }
+        if kf.is_inertial()
+            && let Some(prev) = kf.get_prev_kf()
+            && let Some(&j) = idx.get(&prev.id)
+        {
+            let spw = siw_for(&prev);
+            edges.push(EssentialGraphEdge {
+                i,
+                j,
+                sji: spw.mul(&swi),
+            });
         }
     }
 
@@ -3675,26 +3676,26 @@ pub fn optimize_essential_graph_merge(
     let key = |a: u64, b: u64| (a.min(b), a.max(b));
     for (i, kf) in kfs.iter().enumerate() {
         let swi = siw_for(kf).inverse();
-        if let Some(parent) = kf.get_parent() {
-            if let Some(&j) = idx.get(&parent.id) {
+        if let Some(parent) = kf.get_parent()
+            && let Some(&j) = idx.get(&parent.id)
+        {
+            edges.push(EssentialGraphEdge {
+                i,
+                j,
+                sji: siw_for(&parent).mul(&swi),
+            });
+            inserted.insert(key(kf.id, parent.id));
+        }
+        for lkf in kf.get_loop_edges() {
+            if let Some(&j) = idx.get(&lkf.id)
+                && kf.id < lkf.id
+            {
                 edges.push(EssentialGraphEdge {
                     i,
                     j,
-                    sji: siw_for(&parent).mul(&swi),
+                    sji: siw_for(&lkf).mul(&swi),
                 });
-                inserted.insert(key(kf.id, parent.id));
-            }
-        }
-        for lkf in kf.get_loop_edges() {
-            if let Some(&j) = idx.get(&lkf.id) {
-                if kf.id < lkf.id {
-                    edges.push(EssentialGraphEdge {
-                        i,
-                        j,
-                        sji: siw_for(&lkf).mul(&swi),
-                    });
-                    inserted.insert(key(kf.id, lkf.id));
-                }
+                inserted.insert(key(kf.id, lkf.id));
             }
         }
         for nkf in kf.get_covisibles_by_weight(MIN_FEAT) {

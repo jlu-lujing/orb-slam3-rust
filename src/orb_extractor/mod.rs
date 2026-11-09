@@ -637,10 +637,8 @@ fn distribute_oct_tree(
 
                 // Compact survivors, then append the new children.
                 let mut rebuilt: Vec<ExtractorNode> = Vec::with_capacity(current_count);
-                for slot in slots {
-                    if let Some(node) = slot {
-                        rebuilt.push(node);
-                    }
+                for node in slots.into_iter().flatten() {
+                    rebuilt.push(node);
                 }
                 let survivors = rebuilt.len();
                 rebuilt.extend(new_children);
@@ -722,7 +720,7 @@ fn ic_angle(image: &Mat, pt: Point2f, u_max: &[i32]) -> opencv::Result<f32> {
     }
 
     // C++: return fastAtan2((float)m_01, (float)m_10);
-    Ok(opencv::core::fast_atan2(m_01 as f32, m_10 as f32)?)
+    opencv::core::fast_atan2(m_01 as f32, m_10 as f32)
 }
 
 /// Compute 32-byte rBRIEF descriptors for every keypoint in `keypoints`.
@@ -807,7 +805,7 @@ mod tests {
     fn make_checkerboard(rows: i32, cols: i32, square: i32) -> Mat {
         let mut img =
             Mat::new_rows_cols_with_default(rows, cols, CV_8UC1, Scalar::all(0.0)).unwrap();
-        let stride = img.step1(0).unwrap() as usize;
+        let stride = img.step1(0).unwrap();
         let data = img.data_bytes_mut().unwrap();
         for y in 0..rows {
             for x in 0..cols {
@@ -837,7 +835,7 @@ mod tests {
         let ext = OrbExtractor::new(N_FEATURES, SCALE_FACTOR, N_LEVELS, INI_TH_FAST, MIN_TH_FAST);
 
         assert_eq!(ext.get_levels(), N_LEVELS);
-        assert!(approx_eq(ext.get_scale_factor() as f32, SCALE_FACTOR));
+        assert!(approx_eq(ext.get_scale_factor(), SCALE_FACTOR));
         assert_eq!(ext.get_scale_factors().len(), N_LEVELS);
         assert_eq!(ext.get_inverse_scale_factors().len(), N_LEVELS);
         assert_eq!(ext.get_scale_sigma2().len(), N_LEVELS);

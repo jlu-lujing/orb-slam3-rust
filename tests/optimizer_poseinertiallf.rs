@@ -192,7 +192,7 @@ fn pose_inertial_last_frame_matches_g2o() {
     assert_eq!(got_flags, ref_flags, "outlier classification differs");
     assert_eq!(res.n_inliers, ref_inliers, "inlier count differs");
 
-    let dr = (res.state.rwb.transpose() * ref_state.rwb).into();
+    let dr = res.state.rwb.transpose() * ref_state.rwb;
     assert!(log_so3(&dr).norm() < 1e-6, "rotation differs");
     assert!(
         (res.state.twb - ref_state.twb).norm() < 1e-6,
