@@ -1,6 +1,9 @@
 use clap::{Arg, Command};
-use opencv::core::Point3f;
-use orb_slam3_rs::system::System;
+use nalgebra::Vector3;
+use opencv::imgcodecs::{IMREAD_GRAYSCALE, imread};
+use opencv::prelude::MatTraitConst;
+use orb_slam3_rs::imu_types::Point;
+use orb_slam3_rs::system::{System, SystemError};
 use std::fs::File;
 use std::{
     io::{self, BufRead, BufReader},
@@ -38,7 +41,14 @@ enum RuntimeError {
     InvalidSequenceArgs,
     ImageLoadFailed(io::Error),
     IMULoadFailed(io::Error),
-    SettingsLoadFailed,
+    ImageDecode(PathBuf),
+    SystemInit(SystemError),
+}
+
+impl From<SystemError> for RuntimeError {
+    fn from(error: SystemError) -> Self {
+        RuntimeError::SystemInit(error)
+    }
 }
 
 struct LoadedImages {
@@ -93,8 +103,8 @@ fn load_images(
 }
 
 struct LoadedIMU {
-    acc: Vec<Point3f>,
-    gyro: Vec<Point3f>,
+    acc: Vec<Vector3<f32>>,
+    gyro: Vec<Vector3<f32>>,
     timestamps: Vec<f64>,
 }
 fn load_imu(path_imu: &PathBuf) -> io::Result<LoadedIMU> {
@@ -134,12 +144,12 @@ fn load_imu(path_imu: &PathBuf) -> io::Result<LoadedIMU> {
             ));
         }
         timestamps.push(values[0] / 1e9);
-        gyro.push(Point3f::new(
+        gyro.push(Vector3::new(
             values[1] as f32,
             values[2] as f32,
             values[3] as f32,
         ));
-        acc.push(Point3f::new(
+        acc.push(Vector3::new(
             values[4] as f32,
             values[5] as f32,
             values[6] as f32,
@@ -181,8 +191,8 @@ fn main() -> Result<(), RuntimeError> {
     let mut images_left: Vec<Vec<PathBuf>> = Vec::with_capacity(n_seq);
     let mut images_right: Vec<Vec<PathBuf>> = Vec::with_capacity(n_seq);
     let mut timestamps_cam: Vec<Vec<f64>> = Vec::with_capacity(n_seq);
-    let mut acc: Vec<Vec<Point3f>> = Vec::with_capacity(n_seq);
-    let mut gyro: Vec<Vec<Point3f>> = Vec::with_capacity(n_seq);
+    let mut acc: Vec<Vec<Vector3<f32>>> = Vec::with_capacity(n_seq);
+    let mut gyro: Vec<Vec<Vector3<f32>>> = Vec::with_capacity(n_seq);
     let mut timestamps_imu: Vec<Vec<f64>> = Vec::with_capacity(n_seq);
     let mut n_images: Vec<usize> = Vec::with_capacity(n_seq);
     let mut n_imu: Vec<usize> = Vec::with_capacity(n_seq);
@@ -246,9 +256,68 @@ fn main() -> Result<(), RuntimeError> {
         orb_slam3_rs::system::Sensor::IMUStereo,
         true,
         None,
-    );
+    )?;
 
-    // TODO: here
+    for sequence in 0..n_seq {
+        let mut imu_cursor = first_imu[sequence];
+        for frame_idx in 0..n_images[sequence] {
+            let timestamp = timestamps_cam[sequence][frame_idx];
+            let mut measurements = Vec::new();
+            while imu_cursor < n_imu[sequence] && timestamps_imu[sequence][imu_cursor] <= timestamp
+            {
+                measurements.push(Point::new(
+                    acc[sequence][imu_cursor],
+                    gyro[sequence][imu_cursor],
+                    timestamps_imu[sequence][imu_cursor],
+                ));
+                imu_cursor += 1;
+            }
+
+            let left_path = &images_left[sequence][frame_idx];
+            let right_path = &images_right[sequence][frame_idx];
+            let image_left = imread(&left_path.to_string_lossy(), IMREAD_GRAYSCALE)
+                .map_err(|_| RuntimeError::ImageDecode(left_path.clone()))?;
+            let image_right = imread(&right_path.to_string_lossy(), IMREAD_GRAYSCALE)
+                .map_err(|_| RuntimeError::ImageDecode(right_path.clone()))?;
+            if image_left.empty() {
+                return Err(RuntimeError::ImageDecode(left_path.clone()));
+            }
+            if image_right.empty() {
+                return Err(RuntimeError::ImageDecode(right_path.clone()));
+            }
+
+            let start = std::time::Instant::now();
+            let filename = left_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let _pose =
+                slam.track_stereo(image_left, image_right, timestamp, &measurements, filename);
+            times_track.push(start.elapsed().as_secs_f32() * 1000.0);
+
+            if frame_idx % 100 == 0 {
+                info!(
+                    "Sequence {} frame {}/{} state={:?}",
+                    sequence,
+                    frame_idx + 1,
+                    n_images[sequence],
+                    slam.tracking_state()
+                );
+            }
+        }
+        if sequence + 1 < n_seq {
+            slam.reset_active_map();
+        }
+    }
+
+    slam.shutdown();
+    if !times_track.is_empty() {
+        info!(
+            "Processed {} images, mean tracking time {:.3} ms",
+            times_track.len(),
+            times_track.iter().sum::<f32>() / times_track.len() as f32
+        );
+    }
 
     Ok(())
 }

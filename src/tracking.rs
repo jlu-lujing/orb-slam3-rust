@@ -4,23 +4,28 @@ use crate::{
     frame::{Frame, FrameConstants},
     imu_types::{Bias, Calib, Point, Preintegrated},
     key_frame::KeyFrame,
-    key_frame_database::KeyFrameDatabase,
+    key_frame_database::{KeyFrameDatabase, KeyFrameId},
     local_mapping::LocalMapping,
     loop_closing::LoopClosing,
     map_point::MapPoint,
+    optimizer,
     orb_extractor::OrbExtractor,
+    orb_matcher::OrbMatcher,
     orb_vocabulary::OrbVocabulary,
     settings::{CameraType, Settings},
     system::{Sensor, System},
 };
-use nalgebra::{Isometry3, Matrix3};
+use nalgebra::{Isometry3, Matrix3, Vector3};
 use opencv::imgproc::cvt_color;
 use opencv::prelude::*;
 use opencv::{
     core::{CV_32F, Mat, MatExprTraitConst, Point2f, Point3f, Scalar},
     imgproc::ColorConversionCodes,
 };
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Weak},
+};
 use tracing::{info, warn};
 
 pub struct Tracking {
@@ -124,10 +129,10 @@ pub struct Tracking {
     // Local map
     reference_kf: Option<Arc<KeyFrame>>,
     local_key_frames: Vec<Arc<KeyFrame>>,
-    local_map_points: Vec<Arc<KeyFrame>>,
+    local_map_points: Vec<Arc<MapPoint>>,
 
     // System
-    system: Arc<System>,
+    system: Weak<System>,
 
     // Drawers
     // TODO: others
@@ -212,6 +217,7 @@ pub struct Tracking {
     tlr: Option<Isometry3<f32>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackingState {
     SystemNotReady,
     NoImagesYet,
@@ -387,7 +393,7 @@ impl Tracking {
             orb_vocabulary,
             key_frame_database,
             ready_to_initialize: false,
-            system,
+            system: Arc::downgrade(&system),
             #[cfg(feature = "viewer")]
             step_by_step: false,
             atlas,
@@ -559,7 +565,8 @@ impl Tracking {
         let bf = self.bf.expect("missing bf");
         let th_depth = self.th_depth.expect("missing th_depth");
 
-        self.current_frame = if let Some(camera2) = &self.camera2 {
+        let previous_frame = self.current_frame.take();
+        let next_frame = if let Some(camera2) = &self.camera2 {
             Frame::from_stereo_fisheye(
                 &im_gray,
                 &im_right,
@@ -592,6 +599,16 @@ impl Tracking {
                 imu_calib,
             )
         };
+        self.current_frame = next_frame;
+        if self.current_frame.is_none() {
+            self.current_frame = previous_frame;
+            self.im_gray = Some(im_gray);
+            self.im_right = Some(im_right);
+            return None;
+        }
+        if let Some(previous) = previous_frame {
+            self.last_frame = Some(Arc::new(previous));
+        }
 
         if let Some(current_frame) = self.current_frame.as_mut() {
             current_frame.name_file = filename;
@@ -603,16 +620,559 @@ impl Tracking {
             self.stereo_match_ms.push(current_frame.time_stereo_match);
         }
 
-        if self.current_frame.is_some() {
-            self.track();
+        self.track();
+        self.current_frame.as_ref().map(Frame::get_pose)
+    }
 
-            return Some(self.current_frame.as_ref().unwrap().get_pose());
+    fn insert_stereo_map_points(
+        &self,
+        frame: &mut Frame,
+        kf: &Arc<KeyFrame>,
+        map: Arc<crate::map::Map>,
+        limit: Option<usize>,
+    ) {
+        let mut candidates = Vec::new();
+        if frame.camera2.is_none() {
+            for i in 0..frame.n {
+                let depth = frame.depth.get(i).copied().unwrap_or(-1.0);
+                if depth > 0.0 {
+                    candidates.push((depth, i));
+                }
+            }
+        } else {
+            let n_left = frame.n_left.unwrap_or(0);
+            if let Some(left_to_right) = &frame.left_to_right_match {
+                for i in 0..n_left {
+                    let depth = frame.depth.get(i).copied().unwrap_or(-1.0);
+                    if depth > 0.0 && left_to_right[i] != usize::MAX {
+                        candidates.push((depth, i));
+                    }
+                }
+            }
+        }
+        candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+        let mut created = 0usize;
+        for (depth, i) in candidates {
+            let existing_is_valid = frame
+                .map_points
+                .get(i)
+                .and_then(|mp| mp.as_ref())
+                .is_some_and(|mp| mp.observations() > 0 && !mp.is_bad());
+            if existing_is_valid {
+                continue;
+            }
+
+            let world_pos = if frame.camera2.is_none() {
+                frame.unproject_stereo(i)
+            } else {
+                Some(frame.unproject_stereo_fisheye(i))
+            };
+            let Some(world_pos) = world_pos else {
+                continue;
+            };
+
+            let mp = MapPoint::from_pos_ref(&world_pos, kf.clone(), map.clone());
+            mp.add_observation(kf, i as i32);
+            kf.add_map_point(mp.clone(), i);
+            frame.map_points[i] = Some(mp.clone());
+
+            if frame.camera2.is_some()
+                && let Some(n_left) = frame.n_left
+                && let Some(left_to_right) = &frame.left_to_right_match
+                && left_to_right[i] != usize::MAX
+            {
+                let right_idx = n_left + left_to_right[i];
+                mp.add_observation(kf, right_idx as i32);
+                kf.add_map_point(mp.clone(), right_idx);
+                frame.map_points[right_idx] = Some(mp.clone());
+            }
+
+            mp.compute_distinctive_descriptors();
+            mp.update_normal_and_depth();
+            self.atlas.add_map_point(mp);
+            created += 1;
+
+            if limit.is_some_and(|max| created >= max && depth > frame.th_depth) {
+                break;
+            }
+        }
+    }
+
+    fn stereo_initialization(&mut self, frame: &mut Frame) {
+        if frame.n <= 500 {
+            return;
         }
 
-        self.im_gray = Some(im_gray);
-        self.im_right = Some(im_right);
+        if matches!(self.sensor, Sensor::IMUStereo | Sensor::IMURGBD) {
+            let r_wb = frame
+                .imu_calib
+                .tcb
+                .rotation
+                .to_rotation_matrix()
+                .into_inner();
+            let t_wb = frame.imu_calib.tcb.translation.vector;
+            frame.set_imu_pose_velocity(r_wb, t_wb, Vector3::zeros());
+        } else {
+            frame.set_pose(Isometry3::identity());
+        }
 
-        None
+        let map = self.atlas.get_current_map();
+        let kf = KeyFrame::from_frame(frame, map.clone());
+        self.key_frame_database.add(KeyFrameId(kf.id), &kf.bow_vec);
+        self.atlas.add_key_frame(kf.clone());
+        self.insert_stereo_map_points(frame, &kf, map.clone(), None);
+
+        if let Some(local_mapper) = &self.local_mapper {
+            local_mapper.insert_key_frame(kf.clone());
+        }
+
+        frame.reference_kf = Some(kf.clone());
+        frame.last_keyframe = Some(kf.clone());
+        self.reference_kf = Some(kf.clone());
+        self.last_key_frame = Some(kf.clone());
+        self.last_key_frame_id = Some(frame.id);
+        self.local_key_frames = vec![kf.clone()];
+        self.local_map_points = self.atlas.get_all_map_points().unwrap_or_default();
+        self.atlas
+            .set_reference_map_points(self.local_map_points.clone());
+        map.add_key_frame_origin(kf);
+        self.state = TrackingState::OK;
+        self.created_map = false;
+    }
+
+    fn check_replaced_in_last_frame(&mut self) {
+        if let Some(last) = self.last_frame.as_mut().and_then(|last| Arc::get_mut(last)) {
+            for mp in &mut last.map_points {
+                if let Some(current) = mp
+                    && let Some(replacement) = current.get_replaced()
+                {
+                    *mp = Some(replacement);
+                }
+            }
+        }
+    }
+
+    fn clean_outliers(&mut self, frame: &mut Frame) -> usize {
+        let mut inliers = 0usize;
+        for i in 0..frame.n {
+            let Some(mp) = frame.map_points[i].clone() else {
+                continue;
+            };
+            if frame.outlier[i] {
+                mp.set_track_in_view(false);
+                mp.set_track_in_view_r(false);
+                mp.set_last_frame_seen(frame.id as u64);
+                frame.map_points[i] = None;
+                frame.outlier[i] = false;
+            } else if mp.observations() > 0 && !mp.is_bad() {
+                inliers += 1;
+            }
+        }
+        inliers
+    }
+
+    fn track_reference_key_frame(&mut self, frame: &mut Frame) -> bool {
+        let Some(reference) = self.reference_kf.as_ref() else {
+            return false;
+        };
+        frame.compute_bow();
+        let matcher = OrbMatcher::new(0.7, true);
+        let mut matches = Vec::new();
+        let n_matches = matcher.search_by_bow_frame(reference, frame, &mut matches);
+        if n_matches < 15 {
+            return false;
+        }
+
+        frame.map_points = matches;
+        if let Some(last) = &self.last_frame {
+            frame.set_pose(last.get_pose());
+        } else {
+            frame.set_pose(reference.get_pose());
+        }
+        optimizer::pose_optimization(frame);
+        let inliers = self.clean_outliers(frame);
+        inliers >= 10
+    }
+
+    fn track_with_motion_model(&mut self, frame: &mut Frame) -> bool {
+        let Some(last) = self.last_frame.clone() else {
+            return false;
+        };
+        let Some(velocity) = self.velocity else {
+            return self.track_reference_key_frame(frame);
+        };
+
+        frame.set_pose(velocity * last.get_pose());
+        frame.map_points.fill(None);
+        frame.outlier.fill(false);
+
+        let matcher = OrbMatcher::new(0.9, true);
+        let monocular = matches!(self.sensor, Sensor::Monocular | Sensor::IMUMonocular);
+        let th = if matches!(self.sensor, Sensor::Stereo) {
+            7.0
+        } else {
+            15.0
+        };
+        let mut n_matches = matcher.search_by_projection_last_frame(frame, &last, th, monocular);
+        if n_matches < 20 {
+            frame.map_points.fill(None);
+            n_matches = matcher.search_by_projection_last_frame(frame, &last, 2.0 * th, monocular);
+        }
+        if n_matches < 20 {
+            return matches!(
+                self.sensor,
+                Sensor::IMUMonocular | Sensor::IMUStereo | Sensor::IMURGBD
+            );
+        }
+
+        optimizer::pose_optimization(frame);
+        let inliers = self.clean_outliers(frame);
+        if self.only_tracking {
+            self.visual_odometry = inliers < 10;
+            return n_matches > 20;
+        }
+        inliers >= 10
+    }
+
+    fn update_local_points(&mut self, frame: &Frame) {
+        self.local_map_points.clear();
+        let mut seen = HashSet::new();
+        for kf in self.local_key_frames.iter().rev() {
+            for mp in kf.get_map_point_matches().into_iter().flatten() {
+                if !mp.is_bad() && seen.insert(mp.id) {
+                    self.local_map_points.push(mp);
+                }
+            }
+        }
+        self.atlas
+            .set_reference_map_points(self.local_map_points.clone());
+        let _ = frame;
+    }
+
+    fn update_local_key_frames(&mut self, frame: &Frame) {
+        let mut counts: HashMap<u64, (Arc<KeyFrame>, i32)> = HashMap::new();
+        for mp in frame.map_points.iter().flatten() {
+            if mp.is_bad() {
+                continue;
+            }
+            for (kf, _) in mp.get_observations() {
+                if !kf.is_bad() {
+                    counts
+                        .entry(kf.id)
+                        .and_modify(|(_, count)| *count += 1)
+                        .or_insert((kf, 1));
+                }
+            }
+        }
+
+        let best = counts
+            .values()
+            .max_by_key(|(_, count)| *count)
+            .map(|(kf, _)| kf.clone());
+        let mut local = Vec::with_capacity(counts.len() * 3);
+        let mut ids = HashSet::new();
+        for (kf, _) in counts.into_values() {
+            if ids.insert(kf.id) {
+                local.push(kf);
+            }
+        }
+
+        let first_layer = local.len();
+        for i in 0..first_layer {
+            if local.len() > 80 {
+                break;
+            }
+            for neighbor in local[i].get_best_covisibility_keyframes(10) {
+                if !neighbor.is_bad() && ids.insert(neighbor.id) {
+                    local.push(neighbor);
+                    break;
+                }
+            }
+            for child in local[i].get_children() {
+                if !child.is_bad() && ids.insert(child.id) {
+                    local.push(child);
+                    break;
+                }
+            }
+            if let Some(parent) = local[i].get_parent()
+                && !parent.is_bad()
+                && ids.insert(parent.id)
+            {
+                local.push(parent);
+            }
+        }
+
+        if matches!(
+            self.sensor,
+            Sensor::IMUMonocular | Sensor::IMUStereo | Sensor::IMURGBD
+        ) && local.len() < 80
+        {
+            let mut temporal = self.last_key_frame.clone();
+            for _ in 0..20 {
+                let Some(kf) = temporal.take() else {
+                    break;
+                };
+                if !kf.is_bad() && ids.insert(kf.id) {
+                    local.push(kf.clone());
+                }
+                temporal = kf.get_prev_kf();
+            }
+        }
+
+        self.local_key_frames = local;
+        if let Some(reference) = best {
+            self.reference_kf = Some(reference.clone());
+            if let Some(current) = self.current_frame.as_mut() {
+                current.reference_kf = Some(reference);
+            }
+        }
+    }
+
+    fn update_local_map(&mut self, frame: &Frame) {
+        self.update_local_key_frames(frame);
+        self.update_local_points(frame);
+    }
+
+    fn search_local_points(&self, frame: &mut Frame) {
+        for i in 0..frame.n {
+            let Some(mp) = frame.map_points[i].clone() else {
+                continue;
+            };
+            if mp.is_bad() {
+                frame.map_points[i] = None;
+            } else {
+                mp.increase_visible(1);
+                mp.set_last_frame_seen(frame.id as u64);
+                mp.set_track_in_view(false);
+                mp.set_track_in_view_r(false);
+            }
+        }
+
+        for mp in &self.local_map_points {
+            if mp.last_frame_seen() == frame.id as u64 || mp.is_bad() {
+                continue;
+            }
+            let frustum = frame.is_in_frustum(mp, 0.5);
+            if let Some(left) = frustum.left {
+                mp.set_track_in_view(true);
+                mp.set_track_proj_x(left.proj_x);
+                mp.set_track_proj_y(left.proj_y);
+                mp.set_track_proj_xr(left.proj_xr);
+                mp.set_track_depth(left.depth);
+                mp.set_track_scale_level(left.scale_level);
+                mp.set_track_view_cos(left.view_cos);
+                mp.increase_visible(1);
+            }
+            if let Some(right) = frustum.right {
+                mp.set_track_in_view_r(true);
+                mp.set_track_proj_xr(right.proj_x);
+                mp.set_track_proj_yr(right.proj_y);
+                mp.set_track_depth_r(right.depth);
+                mp.set_track_scale_level_r(right.scale_level);
+                mp.set_track_view_cos_r(right.view_cos);
+                mp.increase_visible(1);
+            }
+        }
+
+        let th = if matches!(self.sensor, Sensor::IMUMonocular | Sensor::IMUStereo) {
+            10.0
+        } else {
+            1.0
+        };
+        let matcher = OrbMatcher::new(0.8, true);
+        matcher.search_by_projection_keypoints_mappoints(
+            frame,
+            &self.local_map_points,
+            th,
+            false,
+            0.0,
+        );
+    }
+
+    fn track_local_map(&mut self, frame: &mut Frame) -> bool {
+        self.tracked_fr += 1;
+        self.update_local_map(frame);
+        self.search_local_points(frame);
+
+        let map = self.atlas.get_current_map();
+        if map.is_imu_initialized() && !self.map_updated {
+            optimizer::pose_inertial_optimization_last_frame(frame, false);
+        } else if map.is_imu_initialized() {
+            optimizer::pose_inertial_optimization_last_keyframe(frame, false);
+        } else {
+            optimizer::pose_optimization(frame);
+        }
+
+        self.matches_inliers = 0;
+        for i in 0..frame.n {
+            let Some(mp) = frame.map_points[i].as_ref() else {
+                continue;
+            };
+            if !frame.outlier[i] {
+                mp.increase_found(1);
+                if !self.only_tracking {
+                    if mp.observations() > 0 {
+                        self.matches_inliers += 1;
+                    }
+                } else {
+                    self.matches_inliers += 1;
+                }
+            } else if matches!(self.sensor, Sensor::Stereo) {
+                frame.map_points[i] = None;
+            }
+        }
+
+        let min_inliers = if matches!(
+            self.sensor,
+            Sensor::IMUMonocular | Sensor::IMUStereo | Sensor::IMURGBD
+        ) {
+            15
+        } else {
+            30
+        };
+        self.matches_inliers >= min_inliers
+    }
+
+    fn need_new_key_frame(&self, frame: &Frame) -> bool {
+        let Some(local_mapper) = &self.local_mapper else {
+            return false;
+        };
+        if matches!(
+            self.sensor,
+            Sensor::IMUMonocular | Sensor::IMUStereo | Sensor::IMURGBD
+        ) && !self.atlas.is_imu_initialized().unwrap_or(false)
+        {
+            return self
+                .last_key_frame
+                .as_ref()
+                .is_some_and(|kf| frame.timestamp - kf.timestamp >= 0.25);
+        }
+        if self.only_tracking || local_mapper.is_stopped() || local_mapper.stop_requested() {
+            return false;
+        }
+
+        let n_kfs = self.atlas.key_frames_in_map().unwrap_or(0);
+        if frame.id < self.last_reloc_frame_id + self.max_frames as usize
+            && n_kfs > self.max_frames as usize
+        {
+            return false;
+        }
+        let Some(reference) = &self.reference_kf else {
+            return false;
+        };
+        let min_obs = if n_kfs <= 2 { 2 } else { 3 };
+        let reference_matches = reference.tracked_map_points(min_obs) as usize;
+
+        let mut tracked_close = 0usize;
+        let mut untracked_close = 0usize;
+        let n_left = frame.n_left.unwrap_or(frame.n);
+        for i in 0..n_left {
+            let depth = frame.depth.get(i).copied().unwrap_or(-1.0);
+            if depth > 0.0 && depth < frame.th_depth {
+                if frame.map_points[i].is_some() && !frame.outlier[i] {
+                    tracked_close += 1;
+                } else {
+                    untracked_close += 1;
+                }
+            }
+        }
+
+        let need_close = tracked_close < 100 && untracked_close > 70;
+        let ratio = if n_kfs < 2 { 0.4 } else { 0.75 };
+        let c1a = frame.id.saturating_sub(self.last_key_frame_id.unwrap_or(0))
+            >= self.max_frames as usize;
+        let c1b = frame.id.saturating_sub(self.last_key_frame_id.unwrap_or(0))
+            >= self.min_frames as usize
+            && local_mapper.accept_key_frames();
+        let c2 = (self.matches_inliers < (reference_matches as f32 * ratio) as usize || need_close)
+            && self.matches_inliers > 15;
+        let c3 = self.last_key_frame.as_ref().is_some_and(|kf| {
+            matches!(
+                self.sensor,
+                Sensor::IMUMonocular | Sensor::IMUStereo | Sensor::IMURGBD
+            ) && frame.timestamp - kf.timestamp >= 0.5
+        });
+
+        if (c1a || c1b) && c2 || c3 {
+            if local_mapper.accept_key_frames() || local_mapper.is_initializing() {
+                true
+            } else {
+                local_mapper.interrupt_ba();
+                local_mapper.keyframes_in_queue() < 3
+            }
+        } else {
+            false
+        }
+    }
+
+    fn create_new_key_frame(&mut self, frame: &mut Frame) {
+        let Some(local_mapper) = self.local_mapper.clone() else {
+            return;
+        };
+        if local_mapper.is_initializing() && !self.atlas.is_imu_initialized().unwrap_or(false) {
+            return;
+        }
+        if !local_mapper.set_not_stop(true) {
+            return;
+        }
+
+        let map = self.atlas.get_current_map();
+        let kf = KeyFrame::from_frame(frame, map.clone());
+        self.key_frame_database.add(KeyFrameId(kf.id), &kf.bow_vec);
+        kf.set_new_bias(frame.imu_bias);
+        self.reference_kf = Some(kf.clone());
+        frame.reference_kf = Some(kf.clone());
+
+        if let Some(last) = &self.last_key_frame {
+            kf.set_prev_kf(last);
+            last.set_next_kf(&kf);
+        }
+        if let Some(calib) = &self.imu_calib {
+            self.imu_preintegrated_from_last_kf = Some(Arc::new(
+                Preintegrated::from_bias_and_calib(&frame.imu_bias, calib),
+            ));
+        }
+
+        self.insert_stereo_map_points(frame, &kf, map, Some(100));
+        local_mapper.insert_key_frame(kf.clone());
+        local_mapper.set_not_stop(false);
+        self.last_key_frame_id = Some(frame.id);
+        self.last_key_frame = Some(kf);
+        self.created_map = false;
+    }
+
+    fn preintegrate_imu(&mut self, frame: &mut Frame) {
+        let Some(calib) = &self.imu_calib else {
+            return;
+        };
+        let mut from_last_kf = self
+            .imu_preintegrated_from_last_kf
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(|| Preintegrated::from_bias_and_calib(&frame.imu_bias, calib));
+        let mut frame_preintegrated = Preintegrated::from_bias_and_calib(&frame.imu_bias, calib);
+
+        let had_measurements = self.queue_imu_data.len() > 1;
+        let mut previous_t = None;
+        for measurement in &self.queue_imu_data {
+            if let Some(previous_t) = previous_t {
+                let dt = (measurement.t - previous_t) as f32;
+                if dt > 0.0 {
+                    from_last_kf.integrate_new_measurement(measurement.a, measurement.w, dt);
+                    frame_preintegrated.integrate_new_measurement(measurement.a, measurement.w, dt);
+                }
+            }
+            previous_t = Some(measurement.t);
+        }
+
+        self.queue_imu_data.clear();
+        if had_measurements {
+            frame.imu_preintegrated = Some(Arc::new(from_last_kf.clone()));
+            frame.imu_preintegrated_frame = Some(Arc::new(frame_preintegrated));
+            self.imu_preintegrated_from_last_kf = Some(Arc::new(from_last_kf));
+            frame.set_integrated();
+        }
     }
 
     // Main tracking function. It is independent of the input sensor
@@ -626,18 +1186,150 @@ impl Tracking {
             self.step = false;
         }
 
-        if let Some(local_mapper) = &self.local_mapper {
-            if true {
-                info!("RACK: Reset map because local mapper set the bad imu flag");
-                // TODO: call rest_active_map on system
+        if self
+            .local_mapper
+            .as_ref()
+            .is_some_and(|mapper| mapper.is_bad_imu())
+        {
+            warn!("Reset requested because LocalMapping reported a bad IMU");
+            self.state = TrackingState::Lost;
+            return;
+        }
+
+        let Some(mut frame) = self.current_frame.take() else {
+            return;
+        };
+        if self.state == TrackingState::NoImagesYet {
+            self.state = TrackingState::NotInitialized;
+        }
+        self.last_processed_state = Some(self.state);
+
+        let is_inertial = matches!(
+            self.sensor,
+            Sensor::IMUMonocular | Sensor::IMUStereo | Sensor::IMURGBD
+        );
+        if is_inertial && self.imu_calib.is_some() {
+            self.preintegrate_imu(&mut frame);
+        }
+
+        if self.state == TrackingState::NotInitialized {
+            match self.sensor {
+                Sensor::Stereo | Sensor::IMUStereo | Sensor::RGBD | Sensor::IMURGBD => {
+                    self.stereo_initialization(&mut frame)
+                }
+                _ => {
+                    // TODO: monocular initialization.
+                }
+            }
+            if self.state != TrackingState::OK {
+                self.current_frame = Some(frame);
+                return;
+            }
+        } else if self.state != TrackingState::Lost {
+            self.check_replaced_in_last_frame();
+            let mut ok =
+                if self.velocity.is_none() && !self.atlas.is_imu_initialized().unwrap_or(false) {
+                    self.track_reference_key_frame(&mut frame)
+                } else {
+                    let tracked = self.track_with_motion_model(&mut frame);
+                    tracked || self.track_reference_key_frame(&mut frame)
+                };
+
+            if ok {
+                ok = self.track_local_map(&mut frame);
+            }
+            self.state = if ok {
+                TrackingState::OK
+            } else {
+                TrackingState::RecentlyLost
+            };
+            if !ok {
+                self.timestamp_lost = Some(frame.timestamp);
+            }
+        } else {
+            self.state = TrackingState::Lost;
+        }
+
+        if self.state == TrackingState::OK || self.state == TrackingState::RecentlyLost {
+            if let Some(last) = &self.last_frame
+                && frame.is_set()
+            {
+                self.velocity = Some(frame.get_pose() * last.get_pose().inverse());
+            }
+            for i in 0..frame.n {
+                if frame.outlier[i] && frame.map_points[i].is_some() {
+                    frame.map_points[i] = None;
+                }
+            }
+
+            let need_keyframe = self.need_new_key_frame(&frame);
+            if need_keyframe && self.state == TrackingState::OK {
+                self.create_new_key_frame(&mut frame);
+            }
+
+            if let Some(reference) = &self.reference_kf
+                && frame.is_set()
+            {
+                frame.reference_kf = Some(reference.clone());
+                self.relative_frame_poses
+                    .push(frame.get_pose() * reference.get_pose_inverse());
+                self.references.push(reference.clone());
+                self.frame_times.push(frame.timestamp);
+                self.lost.push(self.state == TrackingState::Lost);
             }
         }
 
-        // TODO
+        self.current_frame = Some(frame);
     }
 
     pub fn get_matches_inliers(&self) -> usize {
         self.matches_inliers
+    }
+
+    pub fn set_local_mapper(&mut self, local_mapper: Arc<LocalMapping>) {
+        self.local_mapper = Some(local_mapper);
+    }
+
+    pub fn set_loop_closing(&mut self, loop_closing: Arc<LoopClosing>) {
+        self.loop_closing = Some(loop_closing);
+    }
+
+    pub fn grab_imu_data(&mut self, measurement: Point) {
+        self.queue_imu_data.push(measurement);
+    }
+
+    pub fn get_tracking_state(&self) -> TrackingState {
+        self.state
+    }
+
+    pub fn is_lost(&self) -> bool {
+        self.state == TrackingState::Lost
+    }
+
+    pub fn reset_active_map(&mut self) {
+        self.state = TrackingState::NotInitialized;
+        self.last_frame = None;
+        self.reference_kf = None;
+        self.last_key_frame = None;
+        self.velocity = None;
+        self.matches_inliers = 0;
+        self.local_key_frames.clear();
+        self.local_map_points.clear();
+    }
+
+    pub fn update_frame_imu(&mut self, scale: f32, bias: Bias, current_keyframe: Arc<KeyFrame>) {
+        for relative in &mut self.relative_frame_poses {
+            relative.translation.vector *= scale;
+        }
+        self.last_bias = Some(bias);
+        self.last_key_frame = Some(current_keyframe.clone());
+        self.reference_kf = Some(current_keyframe.clone());
+        if let Some(frame) = self.current_frame.as_mut() {
+            frame.set_new_bias(bias);
+            frame.last_keyframe = Some(current_keyframe);
+            frame.reference_kf = Some(self.reference_kf.clone().expect("reference set above"));
+        }
+        self.state = TrackingState::OK;
     }
 
     #[cfg(feature = "register-times")]

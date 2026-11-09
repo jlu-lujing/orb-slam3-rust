@@ -15,6 +15,7 @@ rayon = "1.11.0"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 serde = { version = "1.0.228", features = ["derive"] }
+eframe = { version = "0.37.0", optional = true }
 
 [build-dependencies]
 flate2 = "1.0"
@@ -25,3 +26,9 @@ default = ['register-times','tracker-pause-resume','viewer']
 register-times = []
 tracker-pause-resume = []
 viewer = []
+gui = ["viewer", "dep:eframe"]
+
+[[bin]]
+name = "slam_viewer"
+path = "src/bin/slam_viewer.rs"
+required-features = ["gui"]

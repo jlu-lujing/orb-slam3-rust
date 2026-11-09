@@ -25,7 +25,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 
 use nalgebra::{Isometry3, Matrix3, Vector3};
@@ -86,7 +86,7 @@ struct ConnState {
 }
 
 pub struct KeyFrame {
-    pub imu: bool,
+    imu: AtomicBool,
 
     pub id: u64,
     pub frame_id: usize,
@@ -213,7 +213,7 @@ impl KeyFrame {
         let t_rl = frame.get_relative_pose_trl();
 
         let kf = KeyFrame {
-            imu: map.is_imu_initialized(),
+            imu: AtomicBool::new(map.is_imu_initialized()),
             id: NEXT_ID.fetch_add(1, Ordering::SeqCst),
             frame_id: frame.id,
             timestamp: frame.timestamp,
@@ -297,6 +297,14 @@ impl KeyFrame {
     }
 
     // --- Bag of Words ---------------------------------------------------
+
+    pub fn is_inertial(&self) -> bool {
+        self.imu.load(Ordering::SeqCst)
+    }
+
+    pub fn set_inertial(&self) {
+        self.imu.store(true, Ordering::SeqCst);
+    }
 
     /// Recompute the BoW representation from the descriptors.
     pub fn compute_bow(&mut self) {
@@ -744,6 +752,105 @@ impl KeyFrame {
     pub fn set_not_erase(&self) {
         self.conn.write().unwrap().not_erase = true;
     }
+
+    /// Clear the temporary erase guard and apply a deferred bad-flag request.
+    pub fn set_erase(self: &Arc<Self>) {
+        let erase_now = {
+            let mut conn = self.conn.write().unwrap();
+            if conn.loop_edges.is_empty() {
+                conn.not_erase = false;
+            }
+            conn.to_be_erased && !conn.not_erase
+        };
+        if erase_now {
+            self.set_bad_flag();
+        }
+    }
+
+    /// Mark this keyframe bad and detach it from the map graph.
+    ///
+    /// The root keyframe cannot be removed. Loop/merge edges temporarily defer
+    /// deletion until [`KeyFrame::set_erase`] is called.
+    pub fn set_bad_flag(self: &Arc<Self>) {
+        let Some(map) = self.get_map() else {
+            return;
+        };
+        if self.id == map.get_init_kf_id() {
+            return;
+        }
+        {
+            let mut conn = self.conn.write().unwrap();
+            if conn.bad {
+                return;
+            }
+            if conn.not_erase {
+                conn.to_be_erased = true;
+                return;
+            }
+        }
+
+        for connected in self.get_connected_keyframes() {
+            connected.erase_connection(self);
+        }
+        for mp in self.get_map_point_matches().into_iter().flatten() {
+            mp.erase_observation(self);
+        }
+
+        let parent = self.get_parent();
+        let mut candidates: Vec<Arc<KeyFrame>> = parent.iter().cloned().collect();
+        let mut remaining: HashSet<Arc<KeyFrame>> = self
+            .get_children()
+            .into_iter()
+            .filter(|child| !child.is_bad())
+            .collect();
+
+        while let Some((child, new_parent, _)) = remaining
+            .iter()
+            .flat_map(|child| {
+                child
+                    .get_vector_covisible_keyframes()
+                    .into_iter()
+                    .filter_map(|neighbor| {
+                        candidates
+                            .iter()
+                            .find(|candidate| candidate.id == neighbor.id)
+                            .map(|candidate| {
+                                (
+                                    child.clone(),
+                                    candidate.clone(),
+                                    child.get_weight(candidate),
+                                )
+                            })
+                    })
+            })
+            .max_by_key(|(_, _, weight)| *weight)
+        {
+            child.change_parent(&new_parent);
+            self.erase_child(&child);
+            candidates.push(child.clone());
+            remaining.remove(&child);
+        }
+
+        if let Some(parent) = parent {
+            for child in remaining {
+                child.change_parent(&parent);
+                self.erase_child(&child);
+            }
+            parent.erase_child(self);
+        }
+
+        {
+            let mut conn = self.conn.write().unwrap();
+            conn.connected_weights.clear();
+            conn.ordered.clear();
+            conn.children.clear();
+            conn.bad = true;
+        }
+        map.erase_key_frame(self);
+        // TODO: erase from KeyFrameDatabase once KeyFrame carries a database
+        // back-reference. Query paths already ignore bad keyframes.
+    }
+
     pub fn is_bad(&self) -> bool {
         self.conn.read().unwrap().bad
     }
@@ -1022,7 +1129,7 @@ impl KeyFrame {
             .map(|slot| slot.as_ref().map(|mp| mp.id))
             .collect();
         KeyFrameSnapshot {
-            imu: self.imu,
+            imu: self.imu.load(Ordering::SeqCst),
             id: self.id,
             frame_id: self.frame_id,
             timestamp: self.timestamp,
@@ -1111,7 +1218,7 @@ impl KeyFrame {
         camera2: Option<Arc<dyn GeometricCamera>>,
     ) -> Arc<KeyFrame> {
         let kf = KeyFrame {
-            imu: b.imu,
+            imu: AtomicBool::new(b.imu),
             id: b.id,
             frame_id: b.frame_id,
             timestamp: b.timestamp,

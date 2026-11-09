@@ -37,17 +37,21 @@
 //! Never hold a lock that is "earlier" in this list while waiting on an
 //! "earlier-still" one. `reset` is only ever taken alone.
 
-use nalgebra::{Matrix3, SMatrix, Vector3};
-use std::collections::VecDeque;
+use nalgebra::{
+    Isometry3, Matrix3, Matrix3x4, Point3, Rotation3, SMatrix, Translation3, UnitQuaternion,
+    Vector3,
+};
+use opencv::core::{KeyPoint, KeyPointTraitConst};
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 use tracing::info;
 
-use crate::optimizer;
 use crate::{
-    atlas::Atlas, key_frame::KeyFrame, loop_closing::LoopClosing, map::Map, map_point::MapPoint,
-    system::System, tracking::Tracking,
+    atlas::Atlas, geometric_tools, imu_types::Bias, key_frame::KeyFrame, loop_closing::LoopClosing,
+    map::Map, map_point::MapPoint, optimizer, orb_matcher::OrbMatcher, system::System,
+    tracking::Tracking,
 };
 
 /// Reset-request state
@@ -176,7 +180,7 @@ macro_rules! timed {
 
 pub struct LocalMapping {
     // --- immutable wiring (set once at/after construction) -----------------
-    system: Arc<System>,
+    system: Weak<System>,
     atlas: Arc<Atlas>,
     monocular: bool,
     inertial: bool,
@@ -188,7 +192,7 @@ pub struct LocalMapping {
     th_far_points: f32,
 
     loop_closer: OnceLock<Arc<LoopClosing>>,
-    tracker: OnceLock<Arc<Tracking>>,
+    tracker: OnceLock<Weak<Mutex<Tracking>>>,
 
     // --- lock-free signals (intentionally racy in upstream) ---------------
     /// BA abort flag — the optimizer polls this to bail out early
@@ -226,7 +230,7 @@ impl LocalMapping {
         sequence: String,
     ) -> Self {
         LocalMapping {
-            system,
+            system: Arc::downgrade(&system),
             atlas,
             monocular,
             inertial,
@@ -257,8 +261,8 @@ impl LocalMapping {
     pub fn set_loop_closer(&self, loop_closer: Arc<LoopClosing>) {
         let _ = self.loop_closer.set(loop_closer);
     }
-    pub fn set_tracker(&self, tracker: Arc<Tracking>) {
-        let _ = self.tracker.set(tracker);
+    pub fn set_tracker(&self, tracker: Arc<Mutex<Tracking>>) {
+        let _ = self.tracker.set(Arc::downgrade(&tracker));
     }
 
     // Main function
@@ -331,7 +335,12 @@ impl LocalMapping {
                                     }
                                 }
 
-                                let inliers = self.tracker.get().unwrap().get_matches_inliers();
+                                let inliers = self
+                                    .tracker
+                                    .get()
+                                    .and_then(Weak::upgrade)
+                                    .map(|tracker| tracker.lock().unwrap().get_matches_inliers())
+                                    .unwrap_or(0);
                                 let large = ((inliers > 75) && self.monocular)
                                     || ((inliers > 100) && !self.monocular);
                                 Some(optimizer::local_inertial_ba(
@@ -381,7 +390,12 @@ impl LocalMapping {
                     self.key_frame_culling();
                 }
 
-                // The loop-closing queue is wired in once LoopClosing is ported.
+                if let Some(current) = self.get_curr_kf()
+                    && !current.is_bad()
+                    && let Some(loop_closer) = self.loop_closer.get()
+                {
+                    loop_closer.insert_key_frame(current);
+                }
             } else if self.stop() && !self.bad_imu.load(Ordering::SeqCst) {
                 while self.is_stopped() && !self.check_finish() {
                     std::thread::sleep(Duration::from_micros(3000));
@@ -577,7 +591,212 @@ impl LocalMapping {
         kf.update_connections();
         self.atlas.add_key_frame(kf);
     }
-    fn create_new_map_points(&self) {}
+    fn create_new_map_points(&self) {
+        let Some(current) = self.get_curr_kf() else {
+            return;
+        };
+        let Some(map) = current.get_map() else {
+            return;
+        };
+
+        let nn = if self.monocular { 30 } else { 10 };
+        let mut neighbors = current.get_best_covisibility_keyframes(nn);
+        if self.inertial {
+            let mut previous = Some(current.clone());
+            for _ in 0..nn {
+                let Some(prev) = previous.and_then(|kf| kf.get_prev_kf()) else {
+                    break;
+                };
+                if !neighbors.iter().any(|kf| kf.id == prev.id) {
+                    neighbors.push(prev.clone());
+                }
+                previous = Some(prev);
+            }
+        }
+
+        let matcher = OrbMatcher::default();
+        let mut created = Vec::new();
+
+        for (neighbor_index, neighbor) in neighbors.iter().enumerate() {
+            if neighbor_index > 0 && self.check_new_key_frames() {
+                break;
+            }
+
+            let ow1_left = current.get_camera_center();
+            let ow2_left = neighbor.get_camera_center();
+            let baseline = (ow2_left - ow1_left).norm();
+            if !self.monocular {
+                if baseline < neighbor.b {
+                    continue;
+                }
+            } else {
+                let median_depth = neighbor.compute_scene_median_depth(2);
+                if median_depth <= 0.0 || baseline / median_depth < 0.01 {
+                    continue;
+                }
+            }
+
+            let mut matched_pairs = Vec::new();
+            matcher.search_for_triangulation(&current, neighbor, &mut matched_pairs, false, false);
+
+            for (idx1, idx2) in matched_pairs {
+                let kp1 = keyframe_keypoint(&current, idx1);
+                let kp2 = keyframe_keypoint(neighbor, idx2);
+                let right1 = keyframe_keypoint_is_right(&current, idx1);
+                let right2 = keyframe_keypoint_is_right(neighbor, idx2);
+
+                let (pose1, camera1) = if current.camera2.is_some() && right1 {
+                    (
+                        current.get_right_pose(),
+                        current.camera2.as_ref().expect("right camera").clone(),
+                    )
+                } else {
+                    (current.get_pose(), current.camera.clone())
+                };
+                let (pose2, camera2) = if neighbor.camera2.is_some() && right2 {
+                    (
+                        neighbor.get_right_pose(),
+                        neighbor.camera2.as_ref().expect("right camera").clone(),
+                    )
+                } else {
+                    (neighbor.get_pose(), neighbor.camera.clone())
+                };
+
+                let rcw1 = pose1.rotation.to_rotation_matrix().into_inner();
+                let rcw2 = pose2.rotation.to_rotation_matrix().into_inner();
+                let rwc1 = rcw1.transpose();
+                let rwc2 = rcw2.transpose();
+                let ow1 = pose1.inverse().translation.vector;
+                let ow2 = pose2.inverse().translation.vector;
+
+                let xn1 = camera1.unproject_n(&kp1.pt());
+                let xn2 = camera2.unproject_n(&kp2.pt());
+                let ray1 = rwc1 * xn1;
+                let ray2 = rwc2 * xn2;
+                let denom = ray1.norm() * ray2.norm();
+                if denom <= f32::EPSILON {
+                    continue;
+                }
+                let cos_parallax_rays = ray1.dot(&ray2) / denom;
+
+                let u_right1 = current.u_right.get(idx1).copied().unwrap_or(-1.0);
+                let u_right2 = neighbor.u_right.get(idx2).copied().unwrap_or(-1.0);
+                let stereo1 = current.camera2.is_none() && u_right1 >= 0.0;
+                let stereo2 = neighbor.camera2.is_none() && u_right2 >= 0.0;
+
+                let cos_parallax_stereo1 = if stereo1 {
+                    let depth = current.depth.get(idx1).copied().unwrap_or(-1.0);
+                    if depth > 0.0 {
+                        (2.0 * (current.b * 0.5).atan2(depth)).cos()
+                    } else {
+                        2.0
+                    }
+                } else {
+                    2.0
+                };
+                let cos_parallax_stereo2 = if stereo2 {
+                    let depth = neighbor.depth.get(idx2).copied().unwrap_or(-1.0);
+                    if depth > 0.0 {
+                        (2.0 * (neighbor.b * 0.5).atan2(depth)).cos()
+                    } else {
+                        2.0
+                    }
+                } else {
+                    2.0
+                };
+                let cos_parallax_stereo = cos_parallax_stereo1.min(cos_parallax_stereo2);
+
+                let x3d = if cos_parallax_rays < cos_parallax_stereo
+                    && cos_parallax_rays > 0.0
+                    && (stereo1
+                        || stereo2
+                        || (cos_parallax_rays < 0.9996 && self.inertial)
+                        || (cos_parallax_rays < 0.9998 && !self.inertial))
+                {
+                    let x1 = Vector3::new(xn1.x, xn1.y, 1.0);
+                    let x2 = Vector3::new(xn2.x, xn2.y, 1.0);
+                    let tcw1 = isometry_to_matrix3x4(&pose1);
+                    let tcw2 = isometry_to_matrix3x4(&pose2);
+                    geometric_tools::triangulate(&x1, &x2, &tcw1, &tcw2)
+                } else if stereo1 && cos_parallax_stereo1 < cos_parallax_stereo2 {
+                    current.unproject_stereo(idx1)
+                } else if stereo2 && cos_parallax_stereo2 < cos_parallax_stereo1 {
+                    neighbor.unproject_stereo(idx2)
+                } else {
+                    None
+                };
+                let Some(x3d) = x3d else {
+                    continue;
+                };
+
+                let z1 = rcw1.row(2).transpose().dot(&x3d) + pose1.translation.z;
+                let z2 = rcw2.row(2).transpose().dot(&x3d) + pose2.translation.z;
+                if z1 <= 0.0 || z2 <= 0.0 {
+                    continue;
+                }
+
+                let level1 = kp1.octave() as usize;
+                let level2 = kp2.octave() as usize;
+                if level1 >= current.level_sigma2.len() || level2 >= neighbor.level_sigma2.len() {
+                    continue;
+                }
+
+                let p1 = rcw1 * x3d + pose1.translation.vector;
+                let p2 = rcw2 * x3d + pose2.translation.vector;
+                if !reprojection_is_valid(
+                    &current,
+                    idx1,
+                    &p1,
+                    &camera1,
+                    u_right1,
+                    stereo1,
+                    current.level_sigma2[level1],
+                ) || !reprojection_is_valid(
+                    neighbor,
+                    idx2,
+                    &p2,
+                    &camera2,
+                    u_right2,
+                    stereo2,
+                    neighbor.level_sigma2[level2],
+                ) {
+                    continue;
+                }
+
+                let dist1 = (x3d - ow1).norm();
+                let dist2 = (x3d - ow2).norm();
+                if dist1 <= f32::EPSILON || dist2 <= f32::EPSILON {
+                    continue;
+                }
+                if self.far_points && (dist1 >= self.th_far_points || dist2 >= self.th_far_points) {
+                    continue;
+                }
+
+                let ratio_dist = dist2 / dist1;
+                let ratio_octave = current.scale_factors[level1] / neighbor.scale_factors[level2];
+                let ratio_factor = 1.5 * current.scale_factor;
+                if ratio_dist * ratio_factor < ratio_octave
+                    || ratio_dist > ratio_octave * ratio_factor
+                {
+                    continue;
+                }
+
+                let mp = MapPoint::from_pos_ref(&x3d, current.clone(), map.clone());
+                mp.add_observation(&current, idx1 as i32);
+                mp.add_observation(neighbor, idx2 as i32);
+                current.add_map_point(mp.clone(), idx1);
+                neighbor.add_map_point(mp.clone(), idx2);
+                mp.compute_distinctive_descriptors();
+                mp.update_normal_and_depth();
+                self.atlas.add_map_point(mp.clone());
+                created.push(mp);
+            }
+        }
+
+        if !created.is_empty() {
+            self.recent_added_map_points.lock().unwrap().extend(created);
+        }
+    }
     fn map_point_culling(&self) {
         let current_kf_id = match self.get_curr_kf() {
             Some(kf) => kf.id,
@@ -606,8 +825,159 @@ impl LocalMapping {
 
         *self.recent_added_map_points.lock().unwrap() = retained;
     }
-    fn search_in_neighbors(&self) {}
-    fn key_frame_culling(&self) {}
+    fn search_in_neighbors(&self) {
+        let Some(current) = self.get_curr_kf() else {
+            return;
+        };
+        let nn = if self.monocular { 30 } else { 10 };
+        let mut target = Vec::new();
+        let mut target_ids = HashSet::new();
+
+        for neighbor in current.get_best_covisibility_keyframes(nn) {
+            if !neighbor.is_bad() && target_ids.insert(neighbor.id) {
+                target.push(neighbor);
+            }
+        }
+
+        let first_layer = target.len();
+        for i in 0..first_layer {
+            for second in target[i].get_best_covisibility_keyframes(20) {
+                if second.id != current.id && !second.is_bad() && target_ids.insert(second.id) {
+                    target.push(second);
+                }
+            }
+            if self.abort_ba.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+
+        if self.inertial {
+            let mut previous = current.get_prev_kf();
+            while target.len() < 20 {
+                let Some(kf) = previous else {
+                    break;
+                };
+                previous = kf.get_prev_kf();
+                if !kf.is_bad() && target_ids.insert(kf.id) {
+                    target.push(kf);
+                }
+            }
+        }
+
+        let matcher = OrbMatcher::default();
+        let current_matches = current.get_map_point_matches();
+        for kf in &target {
+            matcher.fuse(kf, &current_matches, 3.0, false);
+            if kf.camera2.is_some() {
+                matcher.fuse(kf, &current_matches, 3.0, true);
+            }
+        }
+
+        if self.abort_ba.load(Ordering::SeqCst) {
+            return;
+        }
+
+        let mut candidates = Vec::new();
+        let mut candidate_ids = HashSet::new();
+        for kf in &target {
+            for mp in kf.get_map_point_matches().into_iter().flatten() {
+                if !mp.is_bad() && candidate_ids.insert(mp.id) {
+                    candidates.push(Some(mp));
+                }
+            }
+        }
+        matcher.fuse(&current, &candidates, 3.0, false);
+        if current.camera2.is_some() {
+            matcher.fuse(&current, &candidates, 3.0, true);
+        }
+
+        for mp in current.get_map_point_matches().into_iter().flatten() {
+            if !mp.is_bad() {
+                mp.compute_distinctive_descriptors();
+                mp.update_normal_and_depth();
+            }
+        }
+
+        current.update_connections();
+    }
+    fn key_frame_culling(&self) {
+        let Some(current) = self.get_curr_kf() else {
+            return;
+        };
+
+        // Inertial culling must merge two Preintegrated measurements and relink
+        // the temporal chain as one atomic operation. Until that API is added,
+        // retaining inertial keyframes is safer than corrupting the IMU graph.
+        if self.inertial {
+            return;
+        }
+
+        let init_kf_id = current
+            .get_map()
+            .map(|map| map.get_init_kf_id())
+            .unwrap_or(0);
+        let redundant_ratio = 0.9;
+
+        for kf in current.get_vector_covisible_keyframes() {
+            if kf.id == init_kf_id || kf.is_bad() {
+                continue;
+            }
+
+            let mut n_map_points = 0usize;
+            let mut n_redundant = 0usize;
+            for (idx, mp) in kf.get_map_point_matches().into_iter().enumerate() {
+                let Some(mp) = mp else {
+                    continue;
+                };
+                if mp.is_bad() {
+                    continue;
+                }
+                if !self.monocular {
+                    let depth = kf.depth.get(idx).copied().unwrap_or(-1.0);
+                    if depth < 0.0 || depth > kf.th_depth {
+                        continue;
+                    }
+                }
+
+                n_map_points += 1;
+                if mp.observations() <= 3 {
+                    continue;
+                }
+
+                let level = keyframe_keypoint(&kf, idx).octave();
+                let mut observations = 0;
+                for (other, (left, right)) in mp.get_observations() {
+                    if other.id == kf.id || other.is_bad() {
+                        continue;
+                    }
+
+                    let mut other_level = i32::MAX;
+                    if left >= 0 {
+                        other_level = keyframe_keypoint(&other, left as usize).octave();
+                    }
+                    if right >= 0 {
+                        let right_level = keyframe_keypoint(&other, right as usize).octave();
+                        other_level = other_level.min(right_level);
+                    }
+
+                    if other_level <= level + 1 {
+                        observations += 1;
+                        if observations > 3 {
+                            break;
+                        }
+                    }
+                }
+
+                if observations > 3 {
+                    n_redundant += 1;
+                }
+            }
+
+            if n_map_points > 0 && n_redundant as f32 > redundant_ratio * n_map_points as f32 {
+                kf.set_bad_flag();
+            }
+        }
+    }
 
     /// Apply a pending reset if one was requested
     fn reset_if_requested(&self) {
@@ -649,12 +1019,228 @@ impl LocalMapping {
 
     fn initialize_imu(
         &self,
-        _prior_g: f32, // default 1e2
-        _prior_a: f32, // default 1e6
-        _first: bool,  // default false
+        prior_g: f32, // default 1e2
+        prior_a: f32, // default 1e6
+        first: bool,  // default false
     ) {
+        if self.reset.lock().unwrap().reset_requested {
+            return;
+        }
+        let Some(current) = self.get_curr_kf() else {
+            return;
+        };
+        let Some(map) = current.get_map() else {
+            return;
+        };
+
+        let min_time = if self.monocular { 2.0 } else { 1.0 };
+        let min_keyframes = 10usize;
+        if map.key_frames_in_map() < min_keyframes {
+            return;
+        }
+
+        let mut chain = Vec::new();
+        let mut cursor = Some(current.clone());
+        let mut seen = HashSet::new();
+        while let Some(kf) = cursor {
+            if !seen.insert(kf.id) {
+                break;
+            }
+            cursor = kf.get_prev_kf();
+            chain.push(kf);
+        }
+        chain.reverse();
+        if chain.len() < min_keyframes || current.timestamp - chain[0].timestamp < min_time {
+            return;
+        }
+
+        self.initializing.store(true, Ordering::SeqCst);
+        while self.check_new_key_frames() {
+            self.process_new_key_frame();
+        }
+        if let Some(updated) = self.get_curr_kf()
+            && chain.last().is_none_or(|kf| kf.id != updated.id)
+        {
+            chain.push(updated);
+        }
+
+        let mut rwg = Matrix3::<f64>::identity();
+        let mut scale = 1.0;
+        let mut bg = current.get_gyro_bias().cast::<f64>();
+        let mut ba = current.get_acc_bias().cast::<f64>();
+        let mut imu = self.imu_init.lock().unwrap();
+        imu.first_ts = chain[0].timestamp;
+
+        if !map.is_imu_initialized() {
+            let mut gravity_direction = Vector3::<f32>::zeros();
+            for kf in &chain {
+                let Some(previous) = kf.get_prev_kf() else {
+                    continue;
+                };
+                let Some(preintegrated) = &kf.imu_preintegrated else {
+                    continue;
+                };
+                gravity_direction -=
+                    previous.get_imu_rotation() * preintegrated.get_updated_delta_velocity();
+                let dt = (kf.timestamp - previous.timestamp) as f32;
+                if dt > 0.0 {
+                    let velocity = (kf.get_imu_position() - previous.get_imu_position()) / dt;
+                    kf.set_velocity(velocity);
+                    previous.set_velocity(velocity);
+                }
+            }
+
+            if gravity_direction.norm() > 1e-6 {
+                gravity_direction.normalize_mut();
+                let gravity_inertial = Vector3::new(0.0, 0.0, -1.0);
+                let cross = gravity_inertial.cross(&gravity_direction);
+                let axis_norm = cross.norm();
+                if axis_norm > 1e-6 {
+                    let angle = gravity_inertial
+                        .dot(&gravity_direction)
+                        .clamp(-1.0, 1.0)
+                        .acos();
+                    rwg = Rotation3::from_axis_angle(&nalgebra::Unit::new_normalize(cross), angle)
+                        .into_inner()
+                        .cast::<f64>();
+                }
+            }
+            imu.rwg = rwg;
+            imu.t_init = current.timestamp - chain[0].timestamp;
+        } else {
+            rwg = imu.rwg;
+            bg = imu.bg;
+            ba = imu.ba;
+        }
+
+        imu.init_time = current.timestamp - chain[0].timestamp;
+        let start = std::time::Instant::now();
+        optimizer::inertial_optimization(
+            &map,
+            &mut rwg,
+            &mut scale,
+            &mut bg,
+            &mut ba,
+            self.monocular,
+            false,
+            prior_g as f64,
+            prior_a as f64,
+        );
+        imu.cost_time = start.elapsed().as_secs_f64();
+
+        if scale < 0.1 || !scale.is_finite() {
+            self.initializing.store(false, Ordering::SeqCst);
+            return;
+        }
+
+        imu.rwg = rwg;
+        imu.scale = scale;
+        imu.bg = bg;
+        imu.ba = ba;
+        imu.n_kfs = chain.len();
+
+        let rotation = UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix_unchecked(
+            rwg.transpose().cast::<f32>(),
+        ));
+        let transform = Isometry3::from_parts(Translation3::new(0.0, 0.0, 0.0), rotation);
+        if (scale - 1.0).abs() > 1e-5 || !self.monocular {
+            map.apply_scaled_rotation(transform, scale as f32, true);
+        }
+        let bias = Bias::from_params(
+            ba[0] as f32,
+            ba[1] as f32,
+            ba[2] as f32,
+            bg[0] as f32,
+            bg[1] as f32,
+            bg[2] as f32,
+        );
+        for kf in &chain {
+            kf.set_inertial();
+            kf.set_new_bias(bias);
+        }
+        if !map.is_imu_initialized() {
+            map.set_imu_initialized();
+        }
+        if let Some(tracker) = self.tracker.get().and_then(Weak::upgrade)
+            && let Ok(mut tracker) = tracker.lock()
+        {
+            tracker.update_frame_imu(scale as f32, bias, current.clone());
+        }
+
+        if first && (prior_a != 0.0 || prior_g != 0.0) {
+            optimizer::full_inertial_ba(
+                &map,
+                100,
+                false,
+                current.id,
+                Some(self.abort_ba.clone()),
+                true,
+                prior_g,
+                prior_a,
+            );
+        }
+        map.increase_change_index();
+        self.initializing.store(false, Ordering::SeqCst);
     }
     fn scale_refinement(&self) {}
+}
+
+fn keyframe_keypoint(kf: &KeyFrame, idx: usize) -> &KeyPoint {
+    match kf.n_left {
+        None => &kf.keys_un[idx],
+        Some(n_left) if idx < n_left => &kf.keys[idx],
+        Some(n_left) => &kf.keys_right.as_ref().expect("keys_right")[idx - n_left],
+    }
+}
+
+fn keyframe_keypoint_is_right(kf: &KeyFrame, idx: usize) -> bool {
+    kf.n_left.is_some_and(|n_left| idx >= n_left)
+}
+
+fn isometry_to_matrix3x4(tcw: &Isometry3<f32>) -> Matrix3x4<f32> {
+    let r = tcw.rotation.to_rotation_matrix().into_inner();
+    let t = tcw.translation.vector;
+    Matrix3x4::new(
+        r[(0, 0)],
+        r[(0, 1)],
+        r[(0, 2)],
+        t[0],
+        r[(1, 0)],
+        r[(1, 1)],
+        r[(1, 2)],
+        t[1],
+        r[(2, 0)],
+        r[(2, 1)],
+        r[(2, 2)],
+        t[2],
+    )
+}
+
+fn reprojection_is_valid(
+    kf: &KeyFrame,
+    idx: usize,
+    point_camera: &Vector3<f32>,
+    camera: &Arc<dyn crate::camera_models::GeometricCamera>,
+    right_coordinate: f32,
+    is_stereo: bool,
+    sigma_square: f32,
+) -> bool {
+    let keypoint = keyframe_keypoint(kf, idx);
+    if !is_stereo {
+        let uv = camera.project_n(&Point3::from(*point_camera));
+        let ex = uv.x - keypoint.pt().x;
+        let ey = uv.y - keypoint.pt().y;
+        return ex * ex + ey * ey <= 5.991 * sigma_square;
+    }
+
+    let invz = 1.0 / point_camera.z;
+    let u = kf.fx * point_camera.x * invz + kf.cx;
+    let v = kf.fy * point_camera.y * invz + kf.cy;
+    let ur = u - kf.bf * invz;
+    let ex = u - keypoint.pt().x;
+    let ey = v - keypoint.pt().y;
+    let er = ur - right_coordinate;
+    ex * ex + ey * ey + er * er <= 7.8 * sigma_square
 }
 
 #[cfg(test)]

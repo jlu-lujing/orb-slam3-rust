@@ -26,6 +26,13 @@ impl Default for OrbMatcher {
     }
 }
 impl OrbMatcher {
+    pub fn new(nn_ratio: f32, check_orientation: bool) -> Self {
+        Self {
+            nn_ratio,
+            check_orientation,
+        }
+    }
+
     // Search matches between Frame keypoints and projected MapPoints. Returns number of matches
     // Used to track the local map (Tracking)
     pub fn search_by_projection_keypoints_mappoints(
@@ -40,28 +47,28 @@ impl OrbMatcher {
         let factor = th != 1.0;
 
         for mp in map_points.iter() {
-            if !mp.track_in_view && !mp.track_in_view_r {
+            if !mp.track_in_view() && !mp.track_in_view_r() {
                 continue;
             }
-            if far_points && mp.track_depth > th_far_points {
+            if far_points && mp.track_depth() > th_far_points {
                 continue;
             }
             if mp.is_bad() {
                 continue;
             }
-            if mp.track_in_view {
-                let predicted_level = mp.track_scale_level;
+            if mp.track_in_view() {
+                let predicted_level = mp.track_scale_level();
 
                 // The size of the window will depend on the viewing direction
-                let mut r = radius_by_viewing_cos(mp.track_view_cos);
+                let mut r = radius_by_viewing_cos(mp.track_view_cos());
 
                 if factor {
                     r *= th;
                 }
 
                 let indices = f.get_features_in_area(
-                    mp.track_proj_x,
-                    mp.track_proj_y,
+                    mp.track_proj_x(),
+                    mp.track_proj_y(),
                     r * f.scale_factors[predicted_level as usize],
                     predicted_level - 1,
                     predicted_level,
@@ -86,7 +93,7 @@ impl OrbMatcher {
                         }
 
                         if f.n_left.is_none() && f.u_right.get(idx).is_some_and(|&v| v > 0.0) {
-                            let er = (mp.track_proj_xr - f.u_right[idx]).abs();
+                            let er = (mp.track_proj_xr() - f.u_right[idx]).abs();
                             if er > r * f.scale_factors[predicted_level as usize] {
                                 continue;
                             }
@@ -152,18 +159,18 @@ impl OrbMatcher {
 
             // Right-camera projection (stereo fisheye only).
             if let Some(n_left) = f.n_left {
-                if mp.track_in_view_r {
-                    let predicted_level = mp.track_scale_level_r;
+                if mp.track_in_view_r() {
+                    let predicted_level = mp.track_scale_level_r();
                     if predicted_level == -1 {
                         continue;
                     }
 
                     // The size of the window will depend on the viewing direction
-                    let r = radius_by_viewing_cos(mp.track_view_cos_r);
+                    let r = radius_by_viewing_cos(mp.track_view_cos_r());
 
                     let indices = f.get_features_in_area(
-                        mp.track_proj_xr,
-                        mp.track_proj_yr,
+                        mp.track_proj_xr(),
+                        mp.track_proj_yr(),
                         r * f.scale_factors[predicted_level as usize],
                         predicted_level - 1,
                         predicted_level,
@@ -888,7 +895,7 @@ impl OrbMatcher {
     // Search matches between MapPoints in a KeyFrame and ORB in a Frame.
     // Brute force constrained to ORB that belong to the same vocabulary node (at a certain level)
     // Used in Relocalisation and Loop Detection
-    fn search_by_bow_frame(
+    pub(crate) fn search_by_bow_frame(
         &self,
         kf: &KeyFrame,
         f: &Frame,
@@ -1345,7 +1352,7 @@ impl OrbMatcher {
     }
 
     // Matching to triangulate new MapPoints. Check Epipolar Constraint.
-    fn search_for_triangulation(
+    pub(crate) fn search_for_triangulation(
         &self,
         kf1: &KeyFrame,
         kf2: &KeyFrame,

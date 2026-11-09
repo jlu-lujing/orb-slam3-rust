@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 
 use nalgebra::Vector3;
@@ -91,20 +91,20 @@ pub struct MapPoint {
     // Single-thread (Tracking) scratch. Populated by the tracker
     // kept as plain fields so the matcher can read them. They are
     // read-only through `Arc` until Tracking wires them up.
-    pub track_proj_x: f32,
-    pub track_proj_y: f32,
-    pub track_proj_xr: f32,
-    pub track_proj_yr: f32,
-    pub track_depth: f32,
-    pub track_depth_r: f32,
-    pub track_in_view: bool,
-    pub track_in_view_r: bool,
-    pub track_scale_level: i32,
-    pub track_scale_level_r: i32,
-    pub track_view_cos: f32,
-    pub track_view_cos_r: f32,
-    pub track_reference_for_frame: u64,
-    pub last_frame_seen: u64,
+    track_proj_x: AtomicU32,
+    track_proj_y: AtomicU32,
+    track_proj_xr: AtomicU32,
+    track_proj_yr: AtomicU32,
+    track_depth: AtomicU32,
+    track_depth_r: AtomicU32,
+    track_in_view: AtomicBool,
+    track_in_view_r: AtomicBool,
+    track_scale_level: AtomicI32,
+    track_scale_level_r: AtomicI32,
+    track_view_cos: AtomicU32,
+    track_view_cos_r: AtomicU32,
+    track_reference_for_frame: AtomicU64,
+    last_frame_seen: AtomicU64,
 
     // Shared mutable state
     pos: RwLock<PosState>,
@@ -157,20 +157,20 @@ impl MapPoint {
             first_kf_id,
             first_frame,
             origin_map_id,
-            track_proj_x: 0.0,
-            track_proj_y: 0.0,
-            track_proj_xr: 0.0,
-            track_proj_yr: 0.0,
-            track_depth: 0.0,
-            track_depth_r: 0.0,
-            track_in_view: false,
-            track_in_view_r: false,
-            track_scale_level: -1,
-            track_scale_level_r: -1,
-            track_view_cos: 0.0,
-            track_view_cos_r: 0.0,
-            track_reference_for_frame: 0,
-            last_frame_seen: 0,
+            track_proj_x: AtomicU32::new(0.0f32.to_bits()),
+            track_proj_y: AtomicU32::new(0.0f32.to_bits()),
+            track_proj_xr: AtomicU32::new(0.0f32.to_bits()),
+            track_proj_yr: AtomicU32::new(0.0f32.to_bits()),
+            track_depth: AtomicU32::new(0.0f32.to_bits()),
+            track_depth_r: AtomicU32::new(0.0f32.to_bits()),
+            track_in_view: AtomicBool::new(false),
+            track_in_view_r: AtomicBool::new(false),
+            track_scale_level: AtomicI32::new(-1),
+            track_scale_level_r: AtomicI32::new(-1),
+            track_view_cos: AtomicU32::new(0.0f32.to_bits()),
+            track_view_cos_r: AtomicU32::new(0.0f32.to_bits()),
+            track_reference_for_frame: AtomicU64::new(0),
+            last_frame_seen: AtomicU64::new(0),
             pos: RwLock::new(PosState {
                 world_pos,
                 normal_vector,
@@ -205,6 +205,93 @@ impl MapPoint {
     /// Read `mnBAGlobalForKF`.
     pub fn get_ba_global_for_kf(&self) -> i64 {
         self.gba.read().unwrap().mn_ba_global_for_kf
+    }
+
+    pub fn track_proj_x(&self) -> f32 {
+        f32::from_bits(self.track_proj_x.load(Ordering::SeqCst))
+    }
+    pub fn set_track_proj_x(&self, value: f32) {
+        self.track_proj_x.store(value.to_bits(), Ordering::SeqCst);
+    }
+    pub fn track_proj_y(&self) -> f32 {
+        f32::from_bits(self.track_proj_y.load(Ordering::SeqCst))
+    }
+    pub fn set_track_proj_y(&self, value: f32) {
+        self.track_proj_y.store(value.to_bits(), Ordering::SeqCst);
+    }
+    pub fn track_proj_xr(&self) -> f32 {
+        f32::from_bits(self.track_proj_xr.load(Ordering::SeqCst))
+    }
+    pub fn set_track_proj_xr(&self, value: f32) {
+        self.track_proj_xr.store(value.to_bits(), Ordering::SeqCst);
+    }
+    pub fn track_proj_yr(&self) -> f32 {
+        f32::from_bits(self.track_proj_yr.load(Ordering::SeqCst))
+    }
+    pub fn set_track_proj_yr(&self, value: f32) {
+        self.track_proj_yr.store(value.to_bits(), Ordering::SeqCst);
+    }
+    pub fn track_depth(&self) -> f32 {
+        f32::from_bits(self.track_depth.load(Ordering::SeqCst))
+    }
+    pub fn set_track_depth(&self, value: f32) {
+        self.track_depth.store(value.to_bits(), Ordering::SeqCst);
+    }
+    pub fn track_depth_r(&self) -> f32 {
+        f32::from_bits(self.track_depth_r.load(Ordering::SeqCst))
+    }
+    pub fn set_track_depth_r(&self, value: f32) {
+        self.track_depth_r.store(value.to_bits(), Ordering::SeqCst);
+    }
+    pub fn track_in_view(&self) -> bool {
+        self.track_in_view.load(Ordering::SeqCst)
+    }
+    pub fn set_track_in_view(&self, value: bool) {
+        self.track_in_view.store(value, Ordering::SeqCst);
+    }
+    pub fn track_in_view_r(&self) -> bool {
+        self.track_in_view_r.load(Ordering::SeqCst)
+    }
+    pub fn set_track_in_view_r(&self, value: bool) {
+        self.track_in_view_r.store(value, Ordering::SeqCst);
+    }
+    pub fn track_scale_level(&self) -> i32 {
+        self.track_scale_level.load(Ordering::SeqCst)
+    }
+    pub fn set_track_scale_level(&self, value: i32) {
+        self.track_scale_level.store(value, Ordering::SeqCst);
+    }
+    pub fn track_scale_level_r(&self) -> i32 {
+        self.track_scale_level_r.load(Ordering::SeqCst)
+    }
+    pub fn set_track_scale_level_r(&self, value: i32) {
+        self.track_scale_level_r.store(value, Ordering::SeqCst);
+    }
+    pub fn track_view_cos(&self) -> f32 {
+        f32::from_bits(self.track_view_cos.load(Ordering::SeqCst))
+    }
+    pub fn set_track_view_cos(&self, value: f32) {
+        self.track_view_cos.store(value.to_bits(), Ordering::SeqCst);
+    }
+    pub fn track_view_cos_r(&self) -> f32 {
+        f32::from_bits(self.track_view_cos_r.load(Ordering::SeqCst))
+    }
+    pub fn set_track_view_cos_r(&self, value: f32) {
+        self.track_view_cos_r
+            .store(value.to_bits(), Ordering::SeqCst);
+    }
+    pub fn track_reference_for_frame(&self) -> u64 {
+        self.track_reference_for_frame.load(Ordering::SeqCst)
+    }
+    pub fn set_track_reference_for_frame(&self, value: u64) {
+        self.track_reference_for_frame
+            .store(value, Ordering::SeqCst);
+    }
+    pub fn last_frame_seen(&self) -> u64 {
+        self.last_frame_seen.load(Ordering::SeqCst)
+    }
+    pub fn set_last_frame_seen(&self, value: u64) {
+        self.last_frame_seen.store(value, Ordering::SeqCst);
     }
 
     /// Default-constructed map point (no position, no reference).

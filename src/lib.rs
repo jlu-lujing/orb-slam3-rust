@@ -71,5 +71,6 @@ unsafe_impl_ffi_send_sync! {
     crate::frame::FrameConstants,
     crate::key_frame::KeyFrame,
     crate::map_point::MapPoint,
+    crate::tracking::Tracking,
     crate::two_view_reconstruction::TwoViewReconstruction,
 }

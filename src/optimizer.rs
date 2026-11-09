@@ -928,7 +928,7 @@ pub fn optimize_sim3(
             // Point not in KF2: synthesize the observation from the projection.
             let invz = 1.0 / x2c[2];
             let obs = Vector2::new(x2c[0] * invz, x2c[1] * invz);
-            let lvl = mp2.track_scale_level.max(0) as usize;
+            let lvl = mp2.track_scale_level().max(0) as usize;
             (obs, kf2.inv_level_sigma2[lvl] as f64)
         };
 
@@ -1651,7 +1651,7 @@ fn gather_inertial_pose_obs(frame: &Frame) -> Vec<InertialPoseObs> {
             continue;
         };
         let xw = mp.get_world_pos().cast::<f64>();
-        let td = mp.track_depth;
+        let td = mp.track_depth();
         if has_rig && i >= n_left {
             continue; // rig right-camera path not yet gathered
         }
@@ -3011,7 +3011,7 @@ pub fn local_inertial_ba(
                     cam_idx: 0,
                 });
             }
-            obs_meta.push((obs_kf.clone(), mp.clone(), is_mono, mp.track_depth));
+            obs_meta.push((obs_kf.clone(), mp.clone(), is_mono, mp.track_depth()));
         }
     }
 
@@ -3580,7 +3580,7 @@ pub fn optimize_essential_graph(
                 });
             }
         }
-        if kf.imu {
+        if kf.is_inertial() {
             if let Some(prev) = kf.get_prev_kf() {
                 if let Some(&j) = idx.get(&prev.id) {
                     let spw = siw_for(&prev);
