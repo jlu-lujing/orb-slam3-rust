@@ -83,6 +83,8 @@ pub struct ViewerKeyFrame {
     pub connections: Vec<u64>,
     pub loop_edges: Vec<u64>,
     pub next_keyframe: Option<u64>,
+    pub origin_map_id: u32,
+    pub active_map: bool,
 }
 
 #[derive(Debug, Clone, Copy)]

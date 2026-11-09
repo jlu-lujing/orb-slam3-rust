@@ -1825,25 +1825,34 @@ impl Tracking {
             .filter(|point| !point.is_bad())
             .map(|point| point.get_world_pos())
             .collect::<Vec<_>>();
-        let keyframes = map
-            .get_all_key_frames()
+        let active_map_id = map.get_id();
+        let keyframes = self
+            .atlas
+            .get_all_maps()
             .into_iter()
-            .filter(|keyframe| !keyframe.is_bad())
-            .map(|keyframe| ViewerKeyFrame {
-                id: keyframe.id,
-                pose: keyframe.get_pose(),
-                parent: keyframe.get_parent().map(|parent| parent.id),
-                connections: keyframe
-                    .get_covisibles_by_weight(100)
+            .flat_map(|map| {
+                let active_map = map.get_id() == active_map_id;
+                map.get_all_key_frames()
                     .into_iter()
-                    .map(|connected| connected.id)
-                    .collect(),
-                loop_edges: keyframe
-                    .get_loop_edges()
-                    .into_iter()
-                    .map(|connected| connected.id)
-                    .collect(),
-                next_keyframe: keyframe.get_next_kf().map(|next| next.id),
+                    .filter(|keyframe| !keyframe.is_bad())
+                    .map(move |keyframe| ViewerKeyFrame {
+                        id: keyframe.id,
+                        pose: keyframe.get_pose(),
+                        parent: keyframe.get_parent().map(|parent| parent.id),
+                        connections: keyframe
+                            .get_covisibles_by_weight(100)
+                            .into_iter()
+                            .map(|connected| connected.id)
+                            .collect(),
+                        loop_edges: keyframe
+                            .get_loop_edges()
+                            .into_iter()
+                            .map(|connected| connected.id)
+                            .collect(),
+                        next_keyframe: keyframe.get_next_kf().map(|next| next.id),
+                        origin_map_id: keyframe.origin_map_id,
+                        active_map,
+                    })
             })
             .collect::<Vec<_>>();
         let current = self.current_frame.as_ref();

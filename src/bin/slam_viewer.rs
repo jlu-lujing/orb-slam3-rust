@@ -236,7 +236,15 @@ impl ViewerApp {
 
         if let Some(snapshot) = &self.snapshot {
             ui.label(format!("Map points: {}", snapshot.map_point_count));
-            ui.label(format!("Keyframes: {}", snapshot.keyframes.len()));
+            ui.label(format!(
+                "Keyframes: {} active / {} atlas",
+                snapshot
+                    .keyframes
+                    .iter()
+                    .filter(|keyframe| keyframe.active_map)
+                    .count(),
+                snapshot.keyframes.len()
+            ));
             ui.label(format!("Features: {}", snapshot.feature_count));
             ui.label(format!("Inliers: {}", snapshot.inlier_count));
             ui.label(format!("IMU initialized: {}", snapshot.imu_initialized));
@@ -478,18 +486,33 @@ impl ViewerApp {
             keyframe_positions.insert(keyframe.id, center);
             if self.show_keyframes {
                 if let Some(position) = project(center) {
-                    painter.circle_filled(position, 2.5, egui::Color32::YELLOW);
+                    painter.circle_filled(
+                        position,
+                        2.5,
+                        if keyframe.active_map {
+                            egui::Color32::YELLOW
+                        } else {
+                            egui::Color32::from_rgb(120, 170, 185)
+                        },
+                    );
                 }
                 draw_frustum(
                     center,
                     inverse.rotation.to_rotation_matrix().into_inner(),
                     (self.camera.distance * 0.018).clamp(0.02, 0.8),
-                    egui::Color32::from_rgb(230, 205, 70),
+                    if keyframe.active_map {
+                        egui::Color32::from_rgb(230, 205, 70)
+                    } else {
+                        egui::Color32::from_rgb(80, 125, 145)
+                    },
                 );
             }
         }
         if self.show_graph {
             for keyframe in &snapshot.keyframes {
+                if !keyframe.active_map {
+                    continue;
+                }
                 let Some(&source) = keyframe_positions.get(&keyframe.id) else {
                     continue;
                 };
@@ -509,6 +532,9 @@ impl ViewerApp {
                 }
             }
             for keyframe in &snapshot.keyframes {
+                if !keyframe.active_map {
+                    continue;
+                }
                 let Some(&source) = keyframe_positions.get(&keyframe.id) else {
                     continue;
                 };
@@ -539,6 +565,9 @@ impl ViewerApp {
         }
         if self.show_inertial_graph && snapshot.imu_initialized {
             for keyframe in &snapshot.keyframes {
+                if !keyframe.active_map {
+                    continue;
+                }
                 let Some(next) = keyframe.next_keyframe else {
                     continue;
                 };
@@ -586,7 +615,11 @@ impl ViewerApp {
             format!(
                 "Map  |  {} points  |  {} keyframes",
                 snapshot.map_point_count,
-                snapshot.keyframes.len()
+                snapshot
+                    .keyframes
+                    .iter()
+                    .filter(|keyframe| keyframe.active_map)
+                    .count()
             ),
             egui::FontId::monospace(12.0),
             egui::Color32::LIGHT_GRAY,
