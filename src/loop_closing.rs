@@ -34,6 +34,14 @@ pub struct LoopClosing {
     finished: AtomicBool,
     running_loop: AtomicBool,
     last_processed: Mutex<Option<u64>>,
+    pending_match: Mutex<Option<PendingMatch>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingMatch {
+    candidate_id: u64,
+    last_current_id: u64,
+    count: u8,
 }
 
 impl LoopClosing {
@@ -57,6 +65,7 @@ impl LoopClosing {
             finished: AtomicBool::new(true),
             running_loop: AtomicBool::new(false),
             last_processed: Mutex::new(None),
+            pending_match: Mutex::new(None),
         }
     }
 
@@ -142,82 +151,58 @@ impl LoopClosing {
         if self.active_loop_closing {
             for candidate in candidates.loop_ {
                 if let Some(loop_kf) = view.key_frames.get(&candidate).cloned()
-                    && self.detect_and_correct(&current, &loop_kf)
+                    && let Some(sim3) = self.detect_sim3(&current, &loop_kf)
+                    && self.confirm_candidate(current.id, loop_kf.id)
                 {
+                    tracing::info!(
+                        "Loop detected: current KF {} matched KF {}",
+                        current.id,
+                        loop_kf.id
+                    );
+                    self.correct_loop(&current, &loop_kf, sim3);
                     break;
                 }
             }
             for candidate in candidates.merge {
                 if let Some(merge_kf) = view.key_frames.get(&candidate).cloned()
-                    && self.detect_and_merge(&current, &merge_kf)
+                    && let Some(sim3) = self.detect_sim3(&current, &merge_kf)
+                    && self.confirm_candidate(current.id, merge_kf.id)
                 {
+                    self.merge_maps(&current, &merge_kf, sim3);
                     break;
                 }
             }
         }
     }
 
-    fn detect_and_correct(&self, current: &Arc<KeyFrame>, candidate: &Arc<KeyFrame>) -> bool {
-        if current.id == candidate.id || current.is_bad() || candidate.is_bad() {
-            return false;
-        }
-
-        let pose = current.get_pose();
-        let current_sim_f32 =
-            nalgebra::Similarity3::from_parts(pose.translation, pose.rotation, 1.0_f32);
-        let current_sim = Sim3::new(
-            pose.rotation.cast::<f64>(),
-            pose.translation.vector.cast::<f64>(),
-            1.0,
-        );
-        let points: Vec<_> = candidate.get_map_points().into_iter().collect();
-        let mut matches = vec![None; current.n];
-        let matcher = OrbMatcher::new(0.75, true);
-        let n_matches = matcher.search_by_projection_similarity_loop_detection(
-            current,
-            &current_sim_f32,
-            &points,
-            &mut matches,
-            8.0,
-            0.75,
-        );
-        if n_matches < 20 {
-            return false;
-        }
-
-        let mut sim3 = current_sim;
-        let inliers = optimizer::optimize_sim3(
-            current,
-            candidate,
-            &mut matches,
-            &mut sim3,
-            10.0,
-            self.fix_scale,
-            true,
-        );
-        if inliers < 20 {
-            return false;
-        }
-
-        tracing::info!(
-            "Loop detected: current KF {} matched KF {} ({} inliers)",
-            current.id,
-            candidate.id,
-            inliers
-        );
-        self.correct_loop(current, candidate, sim3);
-        true
-    }
-
-    fn detect_and_merge(&self, current: &Arc<KeyFrame>, candidate: &Arc<KeyFrame>) -> bool {
-        let Some(detected) = self.detect_sim3(current, candidate) else {
-            return false;
+    fn confirm_candidate(&self, current_id: u64, candidate_id: u64) -> bool {
+        let mut pending = self.pending_match.lock().unwrap();
+        let count = match *pending {
+            Some(previous)
+                if previous.candidate_id == candidate_id
+                    && current_id > previous.last_current_id =>
+            {
+                previous.count.saturating_add(1)
+            }
+            _ => 1,
         };
-        self.merge_maps(current, candidate, detected);
-        true
+        if count >= 3 {
+            *pending = None;
+            true
+        } else {
+            *pending = Some(PendingMatch {
+                candidate_id,
+                last_current_id: current_id,
+                count,
+            });
+            false
+        }
     }
 
     fn detect_sim3(&self, current: &Arc<KeyFrame>, candidate: &Arc<KeyFrame>) -> Option<Sim3> {
+        if current.id == candidate.id || current.is_bad() || candidate.is_bad() {
+            return None;
+        }
         let pose = current.get_pose();
         let current_sim_f32 =
             nalgebra::Similarity3::from_parts(pose.translation, pose.rotation, 1.0_f32);
@@ -279,9 +264,15 @@ impl LoopClosing {
             point.update_map(target.clone());
             target.add_map_point(point);
         }
+        current.add_loop_edge(candidate);
+        candidate.add_loop_edge(current);
         self.atlas.set_current_map(target.clone());
         self.atlas.set_map_bad(source);
         target.increase_change_index();
+
+        if target.is_inertial() {
+            optimizer::merge_inertial_ba(current, candidate, None, &target);
+        }
 
         for keyframe in target.get_all_key_frames() {
             keyframe.update_connections();
@@ -371,6 +362,10 @@ impl LoopClosing {
             &connections,
             self.fix_scale,
         );
+        // ORB-SLAM3 schedules a full BA after the essential-graph correction.
+        // Apply it synchronously while LocalMapping remains stopped so readers
+        // never observe a half-corrected map.
+        optimizer::global_bundle_adjustment(&map, 20, None, map.get_init_kf_id(), false);
 
         for point in map.get_all_map_points() {
             if !point.is_bad() {
@@ -564,5 +559,19 @@ mod tests {
         let queue = loop_closing.key_frames.lock().unwrap();
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].id, keyframe_b.id);
+    }
+
+    #[test]
+    fn loop_confirmation_requires_three_distinct_consecutive_current_keyframes() {
+        let atlas = Arc::new(Atlas::from_kf_id(0));
+        let vocabulary = dummy_voc();
+        let database = Arc::new(KeyFrameDatabase::new(vocabulary.clone()));
+        let loop_closing = LoopClosing::new(atlas, database, vocabulary, true, true);
+
+        assert!(!loop_closing.confirm_candidate(10, 2));
+        assert!(!loop_closing.confirm_candidate(10, 2));
+        assert!(!loop_closing.confirm_candidate(11, 2));
+        assert!(loop_closing.confirm_candidate(12, 2));
+        assert!(!loop_closing.confirm_candidate(13, 2));
     }
 }

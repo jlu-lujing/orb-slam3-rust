@@ -14,10 +14,9 @@
 //! The map is the *strong* owner of its keyframes and map points (it stores
 //! `Arc<KeyFrame>` / `Arc<MapPoint>` keyed by id, where the original C++ keeps
 //! raw `std::set` pointers). The keyframe/map-point graph edges that point back
-//! at a `Map` (or at each other) are [`std::sync::Weak`] to avoid leaking,
-//! except for `KeyFrame::map` / `MapPoint::map`, whose `Arc<Map>` back-pointer
-//! forms a cycle that is a deferred-cleanup concern — matching the C++ `~Map`
-//! `TODO: erase all points from memory`.
+//! at a `Map` (or at each other) are [`std::sync::Weak`] to avoid leaking.
+//! `Map::clear` explicitly detaches keyframes and map points, matching the C++
+//! `UpdateMap(nullptr)` cleanup.
 //!
 //! Cross-object operations (`apply_scaled_rotation`, `clear`) follow the same
 //! discipline as [`crate::map_point`]: snapshot the membership under the lock,
@@ -26,7 +25,7 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use nalgebra::Isometry3;
 
@@ -112,6 +111,8 @@ pub(crate) struct MapSnapshot {
 pub struct Map {
     id: AtomicU32,
     inner: RwLock<MapInner>,
+    /// Non-owning back-reference used when keyframes are culled.
+    key_frame_database: RwLock<Weak<KeyFrameDatabase>>,
 
     /// Keyframes that seeded this map
     key_frame_origins: RwLock<Vec<Arc<KeyFrame>>>,
@@ -148,6 +149,7 @@ impl Map {
         Map {
             id: AtomicU32::new(NEXT_MAP_ID.fetch_add(1, Ordering::SeqCst)),
             inner: RwLock::new(MapInner::default()),
+            key_frame_database: RwLock::new(Weak::new()),
             key_frame_origins: RwLock::new(Vec::new()),
             first_region_kf: RwLock::new(None),
             map_update: Mutex::new(()),
@@ -170,6 +172,16 @@ impl Map {
 
     pub fn get_id(&self) -> u32 {
         self.id.load(Ordering::SeqCst)
+    }
+
+    /// Attach the non-owning keyframe-database back-reference.
+    pub fn set_key_frame_database(&self, database: &Arc<KeyFrameDatabase>) {
+        *self.key_frame_database.write().unwrap() = Arc::downgrade(database);
+    }
+
+    /// Upgraded keyframe database, if this map is attached to an Atlas.
+    pub fn get_key_frame_database(&self) -> Option<Arc<KeyFrameDatabase>> {
+        self.key_frame_database.read().unwrap().upgrade()
     }
 
     /// Reassign the map id (used when merging maps in the atlas).
@@ -213,8 +225,8 @@ impl Map {
         {
             inner.kf_lower = inner.key_frames.values().min_by_key(|k| k.id).cloned();
         }
-        // NOTE: this only detaches the pointer; deleting the keyframe is a
-        // deferred concern (matching the C++ TODO).
+        // The keyframe may still be observed by tracking/database users; drop
+        // the map's ownership here and let `Arc` handle the final lifetime.
     }
 
     pub fn get_all_key_frames(&self) -> Vec<Arc<KeyFrame>> {
@@ -593,20 +605,27 @@ impl Map {
 
     /// Empty the map and reset its IMU/scale state, keeping the init id.
     pub fn clear(&self) {
-        // NOTE: the C++ `clear` also calls `pKF->UpdateMap(nullptr)` on every
-        // keyframe; `KeyFrame::update_map` cannot yet detach a map, so that
-        // step is deferred.
-        let mut inner = self.inner.write().unwrap();
-        inner.map_points.clear();
-        inner.key_frames.clear();
-        inner.max_kf_id = inner.init_kf_id;
-        inner.imu_initialized = false;
-        inner.reference_map_points.clear();
-        inner.kf_initial = None;
-        inner.kf_lower = None;
-        inner.imu_ba1 = false;
-        inner.imu_ba2 = false;
-        drop(inner);
+        let (keyframes, points) = {
+            let mut inner = self.inner.write().unwrap();
+            let keyframes: Vec<_> = inner.key_frames.values().cloned().collect();
+            let points: Vec<_> = inner.map_points.values().cloned().collect();
+            inner.key_frames.clear();
+            inner.map_points.clear();
+            inner.max_kf_id = inner.init_kf_id;
+            inner.imu_initialized = false;
+            inner.reference_map_points.clear();
+            inner.kf_initial = None;
+            inner.kf_lower = None;
+            inner.imu_ba1 = false;
+            inner.imu_ba2 = false;
+            (keyframes, points)
+        };
+        for keyframe in keyframes {
+            keyframe.clear_map();
+        }
+        for point in points {
+            point.clear_map();
+        }
         self.key_frame_origins.write().unwrap().clear();
     }
 
@@ -736,8 +755,10 @@ mod tests {
     #[test]
     fn clear_resets_state() {
         let map = Arc::new(Map::with_init_kf_id(3));
-        map.add_key_frame(make_kf(&map));
-        map.add_map_point(Arc::new(MapPoint::new()));
+        let keyframe = make_kf(&map);
+        let point = Arc::new(MapPoint::new());
+        map.add_key_frame(keyframe.clone());
+        map.add_map_point(point.clone());
         map.set_imu_initialized();
         map.set_inertial_ba1();
 
@@ -750,6 +771,8 @@ mod tests {
         assert!(!map.is_imu_initialized());
         assert!(!map.get_inertial_ba1());
         assert!(map.get_origin_kf().is_none());
+        assert!(keyframe.get_map().is_none());
+        assert!(point.get_map().is_none());
     }
 
     #[test]

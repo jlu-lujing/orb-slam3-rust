@@ -12,6 +12,7 @@ use crate::{
     orb_extractor::OrbExtractor,
     orb_matcher::OrbMatcher,
     orb_vocabulary::{BowVector, OrbVocabulary},
+    pnp::{PnpCorrespondence, solve_pnp_ransac},
     settings::{CameraType, IMUInfo, Settings},
     system::{Sensor, System},
     viewer::{ViewerFeature, ViewerImage, ViewerKeyFrame, ViewerSnapshot},
@@ -137,10 +138,6 @@ pub struct Tracking {
 
     // System
     system: Weak<System>,
-
-    // Viewer step control.
-    #[cfg(feature = "viewer")]
-    step_by_step: bool,
 
     // Atlas
     atlas: Arc<Atlas>,
@@ -465,8 +462,6 @@ impl Tracking {
             key_frame_database,
             ready_to_initialize: false,
             system: Arc::downgrade(&system),
-            #[cfg(feature = "viewer")]
-            step_by_step: false,
             atlas,
             last_reloc_frame_id: 0,
             timestamp_recently_lost: 5.,
@@ -1451,6 +1446,16 @@ impl Tracking {
             if matches < 20 {
                 continue;
             }
+            let Some((pnp_pose, inliers)) = pnp_relocalization_pose(frame) else {
+                continue;
+            };
+            let map_points = std::mem::take(&mut frame.map_points);
+            for (idx, map_point) in map_points.into_iter().enumerate() {
+                if inliers.contains(&idx) {
+                    frame.map_points[idx] = map_point;
+                }
+            }
+            frame.set_pose(pnp_pose);
             optimizer::pose_optimization(frame);
             let inliers = self.clean_outliers(frame);
             tracing::info!(
@@ -1678,15 +1683,6 @@ impl Tracking {
 
     // Main tracking function. It is independent of the input sensor
     fn track(&mut self) {
-        #[cfg(feature = "viewer")]
-        if self.step_by_step {
-            // Step control still needs an external, thread-safe command channel.
-            // Polling a plain bool here would never observe a producer update.
-            warn!("Step-by-step viewer control is not wired yet; continuing");
-            self.step_by_step = false;
-            self.step = false;
-        }
-
         if self
             .local_mapper
             .as_ref()
@@ -1806,6 +1802,18 @@ impl Tracking {
 
     pub fn get_matches_inliers(&self) -> usize {
         self.matches_inliers
+    }
+
+    pub fn get_image_scale(&self) -> f32 {
+        self.image_scale
+    }
+
+    pub fn new_dataset(&mut self) {
+        self.num_dataset = self.num_dataset.saturating_add(1);
+    }
+
+    pub fn get_number_dataset(&self) -> usize {
+        self.num_dataset
     }
 
     pub fn viewer_snapshot(&self) -> ViewerSnapshot {
@@ -1989,14 +1997,7 @@ impl Tracking {
     }
 
     pub fn reset_active_map(&mut self, map: &Arc<crate::map::Map>) {
-        for (lost, reference) in self.lost.iter_mut().zip(&self.references) {
-            if reference
-                .get_map()
-                .is_some_and(|owner| owner.get_id() == map.get_id())
-            {
-                *lost = true;
-            }
-        }
+        mark_lost_for_map(&mut self.lost, &self.references, map.get_id());
 
         let next_frame_id = self
             .current_frame
@@ -2115,6 +2116,12 @@ impl Tracking {
         self.stopped.store(false, Ordering::SeqCst);
     }
     #[cfg(feature = "tracker-pause-resume")]
+    pub fn step(&self) {
+        // Release only this wait. `stop_requested` remains set, so the next
+        // completed frame immediately re-enters the paused state.
+        self.stopped.store(false, Ordering::SeqCst);
+    }
+    #[cfg(feature = "tracker-pause-resume")]
     pub fn stop_requested(&self) -> bool {
         self.stop_requested.load(Ordering::SeqCst)
     }
@@ -2125,6 +2132,82 @@ impl Tracking {
             true
         } else {
             false
+        }
+    }
+}
+
+fn pnp_relocalization_pose(frame: &Frame) -> Option<(Isometry3<f32>, Vec<usize>)> {
+    let rig = frame.camera2.as_ref().zip(frame.n_left);
+    let mut groups: [Vec<(usize, PnpCorrespondence)>; 2] = [Vec::new(), Vec::new()];
+    for (idx, map_point) in frame.map_points.iter().enumerate() {
+        let Some(map_point) = map_point else {
+            continue;
+        };
+        let (camera, keypoint, cam_idx) = if let Some((camera2, n_left)) = rig {
+            if idx < n_left {
+                let Some(keypoint) = frame.keys.get(idx) else {
+                    continue;
+                };
+                (frame.camera.as_ref(), keypoint, 0)
+            } else {
+                let Some(keypoint) = frame
+                    .keys_right
+                    .as_ref()
+                    .and_then(|keys| keys.get(idx - n_left))
+                else {
+                    continue;
+                };
+                (camera2.as_ref(), keypoint, 1)
+            }
+        } else {
+            let Some(keypoint) = frame.keys_un.as_ref().unwrap_or(&frame.keys).get(idx) else {
+                continue;
+            };
+            (frame.camera.as_ref(), keypoint, 0)
+        };
+        let ray = camera.unproject_n(&keypoint.pt());
+        if ray.z.abs() < 1e-6 {
+            continue;
+        }
+        let world = map_point.get_world_pos();
+        groups[cam_idx].push((
+            idx,
+            PnpCorrespondence {
+                world: opencv::core::Point3f::new(world.x, world.y, world.z),
+                bearing: opencv::core::Point2f::new(ray.x / ray.z, ray.y / ray.z),
+            },
+        ));
+    }
+
+    let mut groups: Vec<_> = groups.into_iter().enumerate().collect();
+    groups.sort_by_key(|(_, group)| std::cmp::Reverse(group.len()));
+    for (cam_idx, group) in groups {
+        let correspondences: Vec<_> = group
+            .iter()
+            .map(|(_, correspondence)| *correspondence)
+            .collect();
+        let Some(solution) = solve_pnp_ransac(&correspondences) else {
+            continue;
+        };
+        let tcw = if cam_idx == 1 {
+            frame.get_relative_pose_trl().inverse() * solution.tcw
+        } else {
+            solution.tcw
+        };
+        let indices = solution
+            .inliers
+            .into_iter()
+            .filter_map(|pnp_idx| group.get(pnp_idx).map(|(idx, _)| *idx))
+            .collect();
+        return Some((tcw, indices));
+    }
+    None
+}
+
+fn mark_lost_for_map(lost: &mut [bool], references: &[Arc<KeyFrame>], map_id: u32) {
+    for (lost, reference) in lost.iter_mut().zip(references) {
+        if reference.origin_map_id == map_id {
+            *lost = true;
         }
     }
 }
@@ -2179,8 +2262,10 @@ fn imu_calibration_from_settings(imu: &IMUInfo) -> Calib {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nalgebra::Point3;
+
     use crate::key_frame::KeyFrame;
-    use crate::test_helpers::{build_frame, make_pose};
+    use crate::test_helpers::{build_frame, keypoint, make_pose};
 
     #[test]
     fn imu_calibration_matches_orbslam_noise_scaling() {
@@ -2216,5 +2301,62 @@ mod tests {
         let normalized = export_keyframe_trajectory(&map, false, 1.0, true);
         assert_eq!(normalized.len(), 1);
         assert!((normalized[0].1.to_matrix() - Isometry3::identity().to_matrix()).norm() < 1e-6);
+    }
+
+    #[test]
+    fn relocalization_pnp_recovers_pose_from_frame_bearings() {
+        let map = Arc::new(crate::map::Map::new());
+        let mut frame = build_frame();
+        let expected = make_pose();
+        let world_points = [
+            Point3::new(-1.0, -0.5, 4.0),
+            Point3::new(1.0, -0.5, 4.0),
+            Point3::new(1.0, 0.5, 4.0),
+            Point3::new(-1.0, 0.5, 4.0),
+            Point3::new(-0.8, -0.4, 5.0),
+            Point3::new(0.8, -0.4, 5.0),
+            Point3::new(0.8, 0.4, 5.0),
+            Point3::new(-0.8, 0.4, 5.0),
+        ];
+        let mut keys = Vec::new();
+        let mut map_points = Vec::new();
+        for world in world_points {
+            let camera_point = expected * Point3::new(world.x, world.y, world.z);
+            let uv = frame.camera.project_n_d(&camera_point.cast::<f64>());
+            keys.push(keypoint(uv.x as f32, uv.y as f32));
+            let point = MapPoint::from_frame(
+                &Vector3::new(world.x, world.y, world.z),
+                map.clone(),
+                &frame,
+                0,
+            );
+            point.set_world_pos(Vector3::new(world.x, world.y, world.z));
+            map_points.push(Some(point));
+        }
+        frame.n = keys.len();
+        frame.keys = keys.clone();
+        frame.keys_un = Some(keys);
+        frame.map_points = map_points;
+
+        let (solved, inliers) = pnp_relocalization_pose(&frame).expect("PnP pose");
+        let delta = solved.inverse() * expected;
+        assert!(delta.rotation.angle().abs() < 1e-3);
+        assert!(delta.translation.vector.norm() < 1e-3);
+        assert_eq!(inliers.len(), frame.n);
+    }
+
+    #[test]
+    fn reset_marks_only_active_map_trajectory_entries_lost() {
+        let map_a = Arc::new(crate::map::Map::new());
+        let map_b = Arc::new(crate::map::Map::new());
+        let reference_a = KeyFrame::from_frame(&build_frame(), map_a.clone());
+        let reference_b = KeyFrame::from_frame(&build_frame(), map_b.clone());
+        let references = [reference_a, reference_b];
+        let mut lost = [false, false];
+
+        map_a.clear();
+        mark_lost_for_map(&mut lost, &references, map_a.get_id());
+
+        assert_eq!(lost, [true, false]);
     }
 }

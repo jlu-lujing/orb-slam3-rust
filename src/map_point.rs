@@ -755,6 +755,9 @@ impl MapPoint {
     pub fn update_map(&self, map: Arc<Map>) {
         *self.map.write().unwrap() = Arc::downgrade(&map);
     }
+    pub fn clear_map(&self) {
+        *self.map.write().unwrap() = Weak::new();
+    }
 }
 
 /// Serde-friendly snapshot of a [`MapPoint`].

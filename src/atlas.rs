@@ -232,6 +232,9 @@ impl Atlas {
         let id = new_map.get_id();
         info!("Creation of new map with ID: {}", id);
         let m = Arc::new(new_map);
+        if let Some(database) = self.get_key_frame_database() {
+            m.set_key_frame_database(&database);
+        }
         inner.current_map = Some(m.clone());
         inner.maps.insert(id, m);
     }
@@ -500,7 +503,10 @@ impl Atlas {
     }
 
     pub fn set_key_frame_database(&self, db: Arc<KeyFrameDatabase>) {
-        let _ = self.key_frame_database.set(db);
+        let _ = self.key_frame_database.set(db.clone());
+        for map in self.get_all_maps() {
+            map.set_key_frame_database(&db);
+        }
     }
     pub fn get_key_frame_database(&self) -> Option<Arc<KeyFrameDatabase>> {
         self.key_frame_database.get().cloned()

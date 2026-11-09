@@ -34,9 +34,10 @@ use opencv::core::{KeyPoint, KeyPointTraitConst, Mat, MatTraitConst, Point2f};
 use crate::camera_models::GeometricCamera;
 use crate::frame::{FRAME_GRID_COLS, FRAME_GRID_ROWS, Frame, grid_index};
 use crate::imu_types::{Bias, Calib, Preintegrated};
+use crate::key_frame_database::KeyFrameId;
 use crate::map::Map;
 use crate::map_point::MapPoint;
-use crate::orb_vocabulary::{BowVector, DESC_LEN, Descriptor, FeatureVector};
+use crate::orb_vocabulary::{BowVector, DESC_LEN, Descriptor, FeatureVector, OrbVocabulary};
 use crate::serialization_utils::{SerializableKeyPoint, SerializableMat};
 use serde::{Deserialize, Serialize};
 
@@ -127,6 +128,7 @@ pub struct KeyFrame {
     // BoW (populated at construction)
     pub bow_vec: BowVector,
     pub feat_vec: FeatureVector,
+    orb_vocabulary: Option<Arc<OrbVocabulary>>,
 
     // Scale
     pub scale_levels: usize,
@@ -250,6 +252,7 @@ impl KeyFrame {
             descriptors: frame.descriptors.try_clone().expect("clone descriptors"),
             bow_vec,
             feat_vec,
+            orb_vocabulary: Some(frame.orb_vocabulary.clone()),
             scale_levels: frame.scale_levels,
             scale_factor: frame.scale_factor,
             log_scale_factor: frame.log_scale_factor,
@@ -343,13 +346,11 @@ impl KeyFrame {
 
     /// Recompute the BoW representation from the descriptors.
     pub fn compute_bow(&mut self) {
-        if self.bow_vec.is_empty() {
+        if let Some(vocabulary) = self.orb_vocabulary.as_ref() {
             let descs = descriptors_to_array(&self.descriptors);
-            let voc_descs = descs;
-            // Note: needs the vocabulary; callers that require BoW build it at
-            // construction. This recomputation path is a no-op placeholder when
-            // no vocabulary is attached.
-            let _ = voc_descs;
+            let (bow, feat) = vocabulary.transform(&descs, 4);
+            self.bow_vec = bow;
+            self.feat_vec = feat;
         }
     }
 
@@ -888,9 +889,10 @@ impl KeyFrame {
             conn.children.clear();
             conn.bad = true;
         }
+        if let Some(database) = map.get_key_frame_database() {
+            database.erase(KeyFrameId(self.id), &self.bow_vec);
+        }
         map.erase_key_frame(self);
-        // TODO: erase from KeyFrameDatabase once KeyFrame carries a database
-        // back-reference. Query paths already ignore bad keyframes.
     }
 
     pub fn is_bad(&self) -> bool {
@@ -929,6 +931,9 @@ impl KeyFrame {
     }
     pub fn update_map(&self, map: Arc<Map>) {
         *self.map.write().unwrap() = Arc::downgrade(&map);
+    }
+    pub fn clear_map(&self) {
+        *self.map.write().unwrap() = Weak::new();
     }
 
     // --- Keypoint geometry ---------------------------------------------
@@ -1303,6 +1308,7 @@ impl KeyFrame {
             descriptors: b.descriptors.to_mat().expect("deserialize descriptors"),
             bow_vec: b.bow_vec.clone(),
             feat_vec: b.feat_vec.clone(),
+            orb_vocabulary: None,
             scale_levels: b.scale_levels,
             scale_factor: b.scale_factor,
             log_scale_factor: b.log_scale_factor,
@@ -1445,7 +1451,9 @@ mod tests {
     use opencv::core::{KeyPointTrait, Point2f};
 
     use super::*;
+    use crate::key_frame_database::KeyFrameDatabase;
     use crate::map_point::MapPoint;
+    use crate::orb_vocabulary::OrbVocabulary;
     use crate::test_helpers::*;
 
     #[test]
@@ -1686,5 +1694,56 @@ mod tests {
         assert!(approx(saved.translation.x, expected.translation.x, 1e-6));
         assert!(approx(saved.translation.y, expected.translation.y, 1e-6));
         assert!(approx(saved.translation.z, expected.translation.z, 1e-6));
+    }
+
+    #[test]
+    fn bad_keyframe_is_removed_from_attached_bow_database() {
+        let map = Arc::new(Map::new());
+        let root = KeyFrame::from_frame(&build_frame(), map.clone());
+        let mut text = String::from("1 1 0 0\n0 1 ");
+        for _ in 0..DESC_LEN {
+            text.push_str("0 ");
+        }
+        text.push_str("1.0\n");
+        let vocabulary =
+            Arc::new(OrbVocabulary::load_from_reader(text.as_bytes()).expect("test vocabulary"));
+        let mut victim_frame = build_frame();
+        victim_frame.orb_vocabulary = vocabulary.clone();
+        victim_frame.compute_bow();
+        let victim = KeyFrame::from_frame(&victim_frame, map.clone());
+        map.add_key_frame(root);
+        map.add_key_frame(victim.clone());
+
+        let database = Arc::new(KeyFrameDatabase::new(vocabulary));
+        database.add(KeyFrameId(victim.id), &victim.bow_vec);
+        assert!(database._entry_count() > 0);
+        map.set_key_frame_database(&database);
+
+        victim.set_bad_flag();
+
+        assert!(victim.is_bad());
+        assert_eq!(database._entry_count(), 0);
+    }
+
+    #[test]
+    fn compute_bow_rebuilds_from_attached_vocabulary() {
+        let mut text = String::from("1 1 0 0\n0 1 ");
+        for _ in 0..DESC_LEN {
+            text.push_str("0 ");
+        }
+        text.push_str("1.0\n");
+        let vocabulary =
+            Arc::new(OrbVocabulary::load_from_reader(text.as_bytes()).expect("test vocabulary"));
+        let mut frame = build_frame();
+        frame.orb_vocabulary = vocabulary;
+        frame.compute_bow();
+        let mut keyframe = KeyFrame::from_frame(&frame, Arc::new(Map::new()));
+        let keyframe = Arc::get_mut(&mut keyframe).unwrap();
+        keyframe.bow_vec = BowVector::default();
+        keyframe.feat_vec = crate::orb_vocabulary::FeatureVector::default();
+        keyframe.compute_bow();
+
+        assert!(!keyframe.bow_vec.is_empty());
+        assert!(!keyframe.feat_vec.is_empty());
     }
 }

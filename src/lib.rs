@@ -30,6 +30,7 @@ pub mod optimizer;
 pub mod orb_extractor;
 pub mod orb_matcher;
 pub mod orb_vocabulary;
+pub mod pnp;
 pub mod serialization_utils;
 pub mod settings;
 pub mod system;

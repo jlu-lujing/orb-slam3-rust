@@ -97,3 +97,6 @@ submodule:
 ```bash
 git submodule update --init --recursive
 ```
+
+See [PARITY_AUDIT.md](PARITY_AUDIT.md) for the current method-level comparison,
+verified areas, intentional architectural differences, and remaining risks.

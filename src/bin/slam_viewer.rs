@@ -188,6 +188,12 @@ impl ViewerApp {
                 self.system.resume_tracking();
             }
         }
+        if ui
+            .add_enabled(self.paused, egui::Button::new("Step one frame"))
+            .clicked()
+        {
+            self.system.step_tracking();
+        }
         if ui.button("Reset active map").clicked() {
             self.system.reset_active_map();
         }

@@ -423,6 +423,76 @@ impl System {
         })
     }
 
+    /// Upstream `GetTrackedMapPoints`: map points associated with the last
+    /// successfully tracked frame.
+    pub fn get_tracked_map_points(&self) -> Vec<Arc<crate::map_point::MapPoint>> {
+        let Some(tracking) = self.tracking.get() else {
+            return Vec::new();
+        };
+        let Ok(tracking) = tracking.lock() else {
+            return Vec::new();
+        };
+        tracking
+            .current_frame
+            .as_ref()
+            .into_iter()
+            .flat_map(|frame| frame.map_points.iter().flatten())
+            .filter(|point| !point.is_bad())
+            .cloned()
+            .collect()
+    }
+
+    /// Upstream `GetTrackedKeyPointsUn`: undistorted keypoints currently
+    /// associated with a non-outlier map point.
+    pub fn get_tracked_key_points_un(&self) -> Vec<opencv::core::KeyPoint> {
+        let Some(tracking) = self.tracking.get() else {
+            return Vec::new();
+        };
+        let Ok(tracking) = tracking.lock() else {
+            return Vec::new();
+        };
+        let Some(frame) = tracking.current_frame.as_ref() else {
+            return Vec::new();
+        };
+        let keys = frame.keys_un.as_ref().unwrap_or(&frame.keys);
+        frame
+            .map_points
+            .iter()
+            .zip(&frame.outlier)
+            .enumerate()
+            .filter_map(|(idx, (point, outlier))| {
+                (point.is_some() && !*outlier)
+                    .then(|| keys.get(idx).cloned())
+                    .flatten()
+            })
+            .collect()
+    }
+
+    /// Elapsed time since IMU initialization (`mTinit` upstream).
+    pub fn get_time_from_imu_init(&self) -> f64 {
+        self.local_mapping
+            .get()
+            .map_or(0.0, |mapping| mapping.get_time_from_imu_init())
+    }
+
+    /// Upstream considers initialization complete after 0.1 seconds of
+    /// successfully tracked inertial data.
+    pub fn is_finished(&self) -> bool {
+        self.get_time_from_imu_init() > 0.1
+    }
+
+    pub fn get_image_scale(&self) -> f32 {
+        self.tracking
+            .get()
+            .and_then(|tracking| {
+                tracking
+                    .lock()
+                    .ok()
+                    .map(|tracking| tracking.get_image_scale())
+            })
+            .unwrap_or(1.0)
+    }
+
     pub fn is_lost(&self) -> bool {
         self.tracking
             .get()
@@ -475,6 +545,13 @@ impl System {
     pub fn resume_tracking(&self) {
         if let Some(tracking) = self.tracking.get() {
             tracking.lock().unwrap().release();
+        }
+    }
+
+    #[cfg(feature = "tracker-pause-resume")]
+    pub fn step_tracking(&self) {
+        if let Some(tracking) = self.tracking.get() {
+            tracking.lock().unwrap().step();
         }
     }
 
@@ -880,6 +957,40 @@ mod tests {
         assert_eq!(right.size().expect("right size"), expected_size);
         assert!(!left.empty());
         assert!(!right.empty());
+    }
+
+    #[test]
+    fn mono_and_rgbd_preprocessing_resize_to_configured_size() {
+        let settings_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/euroc.yaml");
+        let mut settings =
+            Settings::new(&settings_path, Sensor::IMUStereo).expect("EuRoC settings");
+        settings.image.need_to_resize = true;
+        settings.image.new_size = opencv::core::Size::new(320, 240);
+        let mut system = System::new_for_test(Sensor::IMUStereo);
+        system.settings = Some(Arc::new(settings));
+
+        let image =
+            Mat::new_rows_cols_with_default(480, 752, CV_8UC1, Scalar::all(80.0)).expect("image");
+        let resized = system.preprocess_image(image).expect("mono resize");
+        assert_eq!(
+            resized.size().expect("size"),
+            opencv::core::Size::new(320, 240)
+        );
+
+        let image =
+            Mat::new_rows_cols_with_default(480, 752, CV_8UC1, Scalar::all(80.0)).expect("image");
+        let depth =
+            Mat::new_rows_cols_with_default(480, 752, opencv::core::CV_32FC1, Scalar::all(2.0))
+                .expect("depth");
+        let (image, depth) = system.preprocess_rgbd(image, depth).expect("RGB-D resize");
+        assert_eq!(
+            image.size().expect("image size"),
+            opencv::core::Size::new(320, 240)
+        );
+        assert_eq!(
+            depth.size().expect("depth size"),
+            opencv::core::Size::new(320, 240)
+        );
     }
 
     #[test]

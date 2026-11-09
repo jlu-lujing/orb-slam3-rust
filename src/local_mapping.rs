@@ -578,6 +578,15 @@ impl LocalMapping {
             None => 0.,
         }
     }
+    /// Elapsed IMU-initialization interval (`mTinit` upstream).
+    pub fn get_time_from_imu_init(&self) -> f64 {
+        let elapsed = self.imu_init.lock().unwrap().t_init;
+        if elapsed > 0.0 && self.atlas.is_imu_initialized().unwrap_or(false) {
+            elapsed
+        } else {
+            0.0
+        }
+    }
     pub fn get_curr_kf(&self) -> Option<Arc<KeyFrame>> {
         self.current_key_frame.lock().unwrap().clone()
     }
