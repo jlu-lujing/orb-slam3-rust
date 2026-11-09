@@ -12,7 +12,7 @@ use crate::{
     orb_extractor::OrbExtractor,
     orb_matcher::OrbMatcher,
     orb_vocabulary::{BowVector, OrbVocabulary},
-    settings::{CameraType, Settings},
+    settings::{CameraType, IMUInfo, Settings},
     system::{Sensor, System},
     viewer::{ViewerFeature, ViewerImage, ViewerKeyFrame, ViewerSnapshot},
 };
@@ -430,15 +430,7 @@ impl Tracking {
         // IMU parameters
         let (insert_kfs_lost, imu_freq, imu_per, imu_calib, imu_preintegrated_from_last_kf) =
             if let Some(imu) = settings.imu.as_ref() {
-                let tbc = &imu.tbc;
-                let sf = imu.imu_frequency.sqrt();
-                let calib = Arc::new(Calib::from_params(
-                    *tbc,
-                    imu.noise_gyro * sf,
-                    imu.noise_acc * sf,
-                    imu.gyro_walk * sf,
-                    imu.acc_walk * sf,
-                ));
+                let calib = Arc::new(imu_calibration_from_settings(imu));
                 (
                     imu.insert_kfs_when_lost,
                     imu.imu_frequency,
@@ -1590,6 +1582,37 @@ impl Tracking {
         let Some(calib) = &self.imu_calib else {
             return;
         };
+        let Some(previous_frame) = frame.prev_frame.clone().or_else(|| self.last_frame.clone())
+        else {
+            frame.set_integrated();
+            return;
+        };
+
+        let previous_timestamp = previous_frame.timestamp;
+        let current_timestamp = frame.timestamp;
+        let boundary_epsilon = self.imu_per;
+        let queue = std::mem::take(&mut self.queue_imu_data);
+        let mut selected = Vec::new();
+        let mut retained = Vec::new();
+        for (index, measurement) in queue.iter().enumerate() {
+            if measurement.t < previous_timestamp - boundary_epsilon {
+                continue;
+            }
+            if measurement.t < current_timestamp - boundary_epsilon {
+                selected.push(measurement.clone());
+            } else {
+                selected.push(measurement.clone());
+                retained.extend(queue[index..].iter().cloned());
+                break;
+            }
+        }
+        self.queue_imu_data = retained;
+        self.imu_from_last_frame = selected.clone();
+        if selected.len() < 2 {
+            frame.set_integrated();
+            return;
+        }
+
         let mut from_last_kf = self
             .imu_preintegrated_from_last_kf
             .as_deref()
@@ -1597,26 +1620,60 @@ impl Tracking {
             .unwrap_or_else(|| Preintegrated::from_bias_and_calib(&frame.imu_bias, calib));
         let mut frame_preintegrated = Preintegrated::from_bias_and_calib(&frame.imu_bias, calib);
 
-        let had_measurements = self.queue_imu_data.len() > 1;
-        let mut previous_t = None;
-        for measurement in &self.queue_imu_data {
-            if let Some(previous_t) = previous_t {
-                let dt = (measurement.t - previous_t) as f32;
+        let count = selected.len();
+        if count == 2 {
+            let dt = (current_timestamp - previous_timestamp) as f32;
+            if dt > 0.0 {
+                from_last_kf.integrate_new_measurement(selected[0].a, selected[0].w, dt);
+                frame_preintegrated.integrate_new_measurement(selected[0].a, selected[0].w, dt);
+            }
+        } else {
+            for index in 0..count - 1 {
+                let current = &selected[index];
+                let next = &selected[index + 1];
+                let interval = (next.t - current.t) as f32;
+                let (acceleration, angular_velocity, dt) = if index == 0 {
+                    let start = (current.t - previous_timestamp) as f32;
+                    let ratio = if interval > 0.0 {
+                        start / interval
+                    } else {
+                        0.0
+                    };
+                    (
+                        (current.a + next.a - (next.a - current.a) * ratio) * 0.5,
+                        (current.w + next.w - (next.w - current.w) * ratio) * 0.5,
+                        (next.t - previous_timestamp) as f32,
+                    )
+                } else if index < count - 2 {
+                    (
+                        (current.a + next.a) * 0.5,
+                        (current.w + next.w) * 0.5,
+                        interval,
+                    )
+                } else {
+                    let end = (next.t - current_timestamp) as f32;
+                    let ratio = if interval > 0.0 { end / interval } else { 0.0 };
+                    (
+                        (current.a + next.a - (next.a - current.a) * ratio) * 0.5,
+                        (current.w + next.w - (next.w - current.w) * ratio) * 0.5,
+                        (current_timestamp - current.t) as f32,
+                    )
+                };
                 if dt > 0.0 {
-                    from_last_kf.integrate_new_measurement(measurement.a, measurement.w, dt);
-                    frame_preintegrated.integrate_new_measurement(measurement.a, measurement.w, dt);
+                    from_last_kf.integrate_new_measurement(acceleration, angular_velocity, dt);
+                    frame_preintegrated.integrate_new_measurement(
+                        acceleration,
+                        angular_velocity,
+                        dt,
+                    );
                 }
             }
-            previous_t = Some(measurement.t);
         }
 
-        self.queue_imu_data.clear();
-        if had_measurements {
-            frame.imu_preintegrated = Some(Arc::new(from_last_kf.clone()));
-            frame.imu_preintegrated_frame = Some(Arc::new(frame_preintegrated));
-            self.imu_preintegrated_from_last_kf = Some(Arc::new(from_last_kf));
-            frame.set_integrated();
-        }
+        frame.imu_preintegrated = Some(Arc::new(from_last_kf.clone()));
+        frame.imu_preintegrated_frame = Some(Arc::new(frame_preintegrated));
+        self.imu_preintegrated_from_last_kf = Some(Arc::new(from_last_kf));
+        frame.set_integrated();
     }
 
     // Main tracking function. It is independent of the input sensor
@@ -1826,6 +1883,44 @@ impl Tracking {
             .collect()
     }
 
+    pub fn frame_trajectory_for_export(
+        &self,
+        map: &Arc<crate::map::Map>,
+        imu_body: bool,
+        timestamp_scale: f64,
+    ) -> Vec<(f64, Isometry3<f32>)> {
+        let mut keyframes = map.get_all_key_frames();
+        keyframes.sort_by_key(|keyframe| keyframe.id);
+        let Some(first) = keyframes.first() else {
+            return Vec::new();
+        };
+        let origin = if imu_body {
+            first.get_imu_pose()
+        } else {
+            first.get_pose_inverse()
+        };
+
+        self.relative_frame_poses
+            .iter()
+            .zip(&self.references)
+            .zip(&self.frame_times)
+            .zip(&self.lost)
+            .filter_map(|(((relative, reference), &timestamp), &lost)| {
+                if lost {
+                    return None;
+                }
+                let (resolved_pose, tbc) = self.resolve_reference_pose(reference, map)?;
+                let trw = resolved_pose * origin;
+                let pose = if imu_body {
+                    (tbc * *relative * trw).inverse()
+                } else {
+                    (*relative * trw).inverse()
+                };
+                Some((timestamp * timestamp_scale, pose))
+            })
+            .collect()
+    }
+
     pub fn keyframe_trajectory(&self) -> Vec<(f64, Isometry3<f32>)> {
         let mut trajectory = self
             .atlas
@@ -1837,6 +1932,40 @@ impl Tracking {
             .collect::<Vec<_>>();
         trajectory.sort_by(|left, right| left.0.total_cmp(&right.0));
         trajectory
+    }
+
+    pub fn keyframe_trajectory_for_export(
+        &self,
+        map: &Arc<crate::map::Map>,
+        imu_body: bool,
+        timestamp_scale: f64,
+        normalize_origin: bool,
+    ) -> Vec<(f64, Isometry3<f32>)> {
+        export_keyframe_trajectory(map, imu_body, timestamp_scale, normalize_origin)
+    }
+
+    fn resolve_reference_pose(
+        &self,
+        reference: &Arc<KeyFrame>,
+        map: &Arc<crate::map::Map>,
+    ) -> Option<(Isometry3<f32>, Isometry3<f32>)> {
+        let mut keyframe = reference.clone();
+        let mut correction = Isometry3::identity();
+        let mut guard = 0;
+        while keyframe.is_bad() {
+            correction *= keyframe
+                .get_pose_to_parent()
+                .unwrap_or(Isometry3::identity());
+            keyframe = keyframe.get_parent()?;
+            guard += 1;
+            if guard > 10_000 {
+                return None;
+            }
+        }
+        if keyframe.get_map().map(|owner| owner.get_id()) != Some(map.get_id()) {
+            return None;
+        }
+        Some((correction * keyframe.get_pose(), keyframe.imu_calib.tbc))
     }
 
     pub fn set_local_mapper(&mut self, local_mapper: Arc<LocalMapping>) {
@@ -1859,15 +1988,53 @@ impl Tracking {
         self.state == TrackingState::Lost
     }
 
-    pub fn reset_active_map(&mut self) {
-        self.state = TrackingState::NotInitialized;
+    pub fn reset_active_map(&mut self, map: &Arc<crate::map::Map>) {
+        for (lost, reference) in self.lost.iter_mut().zip(&self.references) {
+            if reference
+                .get_map()
+                .is_some_and(|owner| owner.get_id() == map.get_id())
+            {
+                *lost = true;
+            }
+        }
+
+        let next_frame_id = self
+            .current_frame
+            .as_ref()
+            .map_or(self.init_id + 1, |frame| frame.id.saturating_add(1));
+        self.state = TrackingState::NoImagesYet;
+        self.last_processed_state = None;
+        self.ready_to_initialize = false;
+        self.created_map = false;
+        self.current_frame = None;
         self.last_frame = None;
+        self.initial_frame = None;
         self.reference_kf = None;
         self.last_key_frame = None;
+        self.last_key_frame_id = None;
+        self.last_init_frame_id = None;
+        self.first_imu_frame_id = None;
+        self.initial_frame_id = next_frame_id;
+        self.last_reloc_frame_id = next_frame_id;
+        self.init_id = next_frame_id;
         self.velocity = None;
+        self.last_bias = None;
         self.matches_inliers = 0;
+        self.ini_matches.clear();
+        self.prev_matched.clear();
+        self.ini_p3d.clear();
+        self.queue_imu_data.clear();
+        self.imu_from_last_frame.clear();
+        self.relative_frame_poses.shrink_to_fit();
+        self.references.shrink_to_fit();
+        self.frame_times.shrink_to_fit();
+        self.lost.shrink_to_fit();
         self.local_key_frames.clear();
         self.local_map_points.clear();
+        self.t0 = 0.0;
+        self.t0vis = 0.0;
+        self.t0imu = 0.0;
+        self.timestamp_lost = None;
     }
 
     pub fn update_frame_imu(&mut self, scale: f32, bias: Bias, current_keyframe: Arc<KeyFrame>) {
@@ -1959,5 +2126,95 @@ impl Tracking {
         } else {
             false
         }
+    }
+}
+
+fn export_keyframe_trajectory(
+    map: &crate::map::Map,
+    imu_body: bool,
+    timestamp_scale: f64,
+    normalize_origin: bool,
+) -> Vec<(f64, Isometry3<f32>)> {
+    let mut keyframes = map.get_all_key_frames();
+    keyframes.sort_by_key(|keyframe| keyframe.id);
+    let origin = keyframes.first().map(|first| {
+        if normalize_origin {
+            if imu_body {
+                first.get_imu_pose()
+            } else {
+                first.get_pose_inverse()
+            }
+        } else {
+            Isometry3::identity()
+        }
+    });
+    let Some(origin) = origin else {
+        return Vec::new();
+    };
+    keyframes
+        .into_iter()
+        .filter(|keyframe| !keyframe.is_bad())
+        .map(|keyframe| {
+            let pose = if imu_body {
+                (keyframe.imu_calib.tbc * keyframe.get_pose() * origin).inverse()
+            } else {
+                (keyframe.get_pose() * origin).inverse()
+            };
+            (keyframe.timestamp * timestamp_scale, pose)
+        })
+        .collect()
+}
+
+fn imu_calibration_from_settings(imu: &IMUInfo) -> Calib {
+    let scale = imu.imu_frequency.sqrt();
+    Calib::from_params(
+        imu.tbc,
+        imu.noise_gyro * scale,
+        imu.noise_acc * scale,
+        imu.gyro_walk / scale,
+        imu.acc_walk / scale,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::key_frame::KeyFrame;
+    use crate::test_helpers::{build_frame, make_pose};
+
+    #[test]
+    fn imu_calibration_matches_orbslam_noise_scaling() {
+        let imu = IMUInfo {
+            noise_gyro: 0.01,
+            noise_acc: 0.02,
+            gyro_walk: 0.03,
+            acc_walk: 0.04,
+            imu_frequency: 400.0,
+            tbc: Isometry3::identity(),
+            insert_kfs_when_lost: true,
+        };
+        let calibration = imu_calibration_from_settings(&imu);
+        let noise = calibration.get_cov();
+        let walk = calibration.get_cov_walk();
+        assert!((noise[(0, 0)] - (0.01_f32 * 20.0).powi(2)).abs() < 1e-8);
+        assert!((noise[(3, 3)] - (0.02_f32 * 20.0).powi(2)).abs() < 1e-8);
+        assert!((walk[(0, 0)] - (0.03_f32 / 20.0).powi(2)).abs() < 1e-10);
+        assert!((walk[(3, 3)] - (0.04_f32 / 20.0).powi(2)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn keyframe_export_keeps_world_pose_and_only_normalizes_when_requested() {
+        let map = Arc::new(crate::map::Map::new());
+        let first = KeyFrame::from_frame(&build_frame(), map.clone());
+        first.set_pose(make_pose());
+        map.add_key_frame(first.clone());
+
+        let direct = export_keyframe_trajectory(&map, false, 1.0, false);
+        assert_eq!(direct.len(), 1);
+        assert!((direct[0].1.to_matrix() - first.get_pose_inverse().to_matrix()).norm() < 1e-6);
+
+        let normalized = export_keyframe_trajectory(&map, false, 1.0, true);
+        assert_eq!(normalized.len(), 1);
+        assert!((normalized[0].1.to_matrix() - Isometry3::identity().to_matrix()).norm() < 1e-6);
     }
 }

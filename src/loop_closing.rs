@@ -8,11 +8,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
+use nalgebra::Translation3;
+
 use crate::atlas::Atlas;
 use crate::g2o_core::Sim3;
 use crate::key_frame::KeyFrame;
 use crate::key_frame_database::{KeyFrameDatabase, KeyFrameId, KeyFrameView, MapId};
 use crate::local_mapping::LocalMapping;
+use crate::map::Map;
+use crate::map_point::MapPoint;
 use crate::optimizer::{self, KeyFrameAndPose, LoopConnections};
 use crate::orb_matcher::OrbMatcher;
 use crate::orb_vocabulary::{BowVector, OrbVocabulary};
@@ -25,6 +29,7 @@ pub struct LoopClosing {
     active_loop_closing: bool,
     local_mapping: OnceLock<Weak<LocalMapping>>,
     key_frames: Mutex<VecDeque<Arc<KeyFrame>>>,
+    reset_active_map: Mutex<Option<Arc<Map>>>,
     finish_requested: AtomicBool,
     finished: AtomicBool,
     running_loop: AtomicBool,
@@ -47,6 +52,7 @@ impl LoopClosing {
             active_loop_closing,
             local_mapping: OnceLock::new(),
             key_frames: Mutex::new(VecDeque::new()),
+            reset_active_map: Mutex::new(None),
             finish_requested: AtomicBool::new(false),
             finished: AtomicBool::new(true),
             running_loop: AtomicBool::new(false),
@@ -74,6 +80,18 @@ impl LoopClosing {
         self.finish_requested.store(true, Ordering::SeqCst);
     }
 
+    /// Drop queued keyframes from `map` and block until the loop-closing
+    /// worker has acknowledged the request.
+    pub fn request_reset_active_map(&self, map: Arc<Map>) {
+        *self.reset_active_map.lock().unwrap() = Some(map);
+        loop {
+            if self.reset_active_map.lock().unwrap().is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_micros(3000));
+        }
+    }
+
     pub fn is_finished(&self) -> bool {
         self.finished.load(Ordering::SeqCst)
     }
@@ -81,6 +99,7 @@ impl LoopClosing {
     pub fn run(&self) {
         self.finished.store(false, Ordering::SeqCst);
         loop {
+            self.reset_if_requested();
             let next = self.key_frames.lock().unwrap().pop_front();
             if let Some(current) = next {
                 if !current.is_bad() {
@@ -95,6 +114,17 @@ impl LoopClosing {
             }
         }
         self.finished.store(true, Ordering::SeqCst);
+    }
+
+    fn reset_if_requested(&self) {
+        let reset_map = self.reset_active_map.lock().unwrap().take();
+        if let Some(map) = reset_map {
+            self.key_frames.lock().unwrap().retain(|keyframe| {
+                keyframe
+                    .get_map()
+                    .is_none_or(|owner| owner.get_id() != map.get_id())
+            });
+        }
     }
 
     fn process_keyframe(&self, current: Arc<KeyFrame>) {
@@ -230,9 +260,9 @@ impl LoopClosing {
             return;
         }
         self.running_loop.store(true, Ordering::SeqCst);
-        if let Some(mapping) = self.local_mapping.get().and_then(Weak::upgrade) {
-            mapping.request_stop();
-            mapping.empty_queue();
+        if !self.stop_mapper() {
+            self.running_loop.store(false, Ordering::SeqCst);
+            return;
         }
 
         let transform = nalgebra::Isometry3::from_parts(
@@ -264,15 +294,9 @@ impl LoopClosing {
 
     fn correct_loop(&self, current: &Arc<KeyFrame>, candidate: &Arc<KeyFrame>, sim3: Sim3) {
         self.running_loop.store(true, Ordering::SeqCst);
-        if let Some(mapping) = self.local_mapping.get().and_then(Weak::upgrade) {
-            mapping.request_stop();
-            for _ in 0..1000 {
-                if mapping.is_stopped() || mapping.is_finished() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_micros(3000));
-            }
-            mapping.empty_queue();
+        if !self.stop_mapper() {
+            self.running_loop.store(false, Ordering::SeqCst);
+            return;
         }
 
         current.add_loop_edge(candidate);
@@ -290,9 +314,22 @@ impl LoopClosing {
             1.0,
         );
         let corrected_current = sim3.mul(&candidate_sim);
+        let current_neighbors = Self::loop_neighborhood(current);
+        let loop_neighbors = Self::loop_neighborhood(candidate);
+        let loop_points = Self::loop_points(&loop_neighbors);
         let mut corrected: KeyFrameAndPose = HashMap::new();
+        for keyframe in &current_neighbors {
+            corrected.insert(
+                keyframe.id,
+                sim3.mul(&optimizer::sim3_from_pose(&keyframe.get_pose())),
+            );
+        }
         corrected.insert(current.id, corrected_current);
-        let non_corrected: KeyFrameAndPose = HashMap::new();
+        let non_corrected: KeyFrameAndPose = current_neighbors
+            .iter()
+            .chain(loop_neighbors.iter())
+            .map(|keyframe| (keyframe.id, optimizer::sim3_from_pose(&keyframe.get_pose())))
+            .collect();
         let mut connections: LoopConnections = HashMap::new();
         connections
             .entry(current.id)
@@ -302,6 +339,28 @@ impl LoopClosing {
             .entry(candidate.id)
             .or_default()
             .insert(current.id);
+        for current_kf in &current_neighbors {
+            for loop_kf in &loop_neighbors {
+                if Self::common_map_point_count(current_kf, loop_kf) < 100 {
+                    continue;
+                }
+                connections
+                    .entry(current_kf.id)
+                    .or_default()
+                    .insert(loop_kf.id);
+                connections
+                    .entry(loop_kf.id)
+                    .or_default()
+                    .insert(current_kf.id);
+                current_kf.add_loop_edge(loop_kf);
+                loop_kf.add_loop_edge(current_kf);
+            }
+        }
+
+        let fused = self.search_and_fuse(&corrected, &loop_points);
+        if fused > 0 {
+            tracing::info!("Loop closure fused {fused} duplicate map points");
+        }
 
         optimizer::optimize_essential_graph(
             &map,
@@ -331,15 +390,90 @@ impl LoopClosing {
         }
         self.running_loop.store(false, Ordering::SeqCst);
     }
+
+    fn stop_mapper(&self) -> bool {
+        let Some(mapping) = self.local_mapping.get().and_then(Weak::upgrade) else {
+            return true;
+        };
+        mapping.request_stop();
+        for _ in 0..1000 {
+            if mapping.is_stopped() || mapping.is_finished() {
+                mapping.empty_queue();
+                return true;
+            }
+            std::thread::sleep(Duration::from_micros(3000));
+        }
+        tracing::error!("local mapper did not stop; aborting loop-closing update");
+        false
+    }
+
+    fn search_and_fuse(&self, corrected: &KeyFrameAndPose, points: &[Arc<MapPoint>]) -> usize {
+        let matcher = OrbMatcher::new(0.8, true);
+        let keyframes: HashMap<_, _> = self.atlas.get_atlas_key_frames().into_iter().collect();
+        let mut total = 0;
+        let mut keyframe_ids: Vec<_> = corrected.keys().copied().collect();
+        keyframe_ids.sort_unstable();
+        for keyframe_id in keyframe_ids {
+            let Some(scw) = corrected.get(&keyframe_id) else {
+                continue;
+            };
+            let Some(keyframe) = keyframes.get(&keyframe_id) else {
+                continue;
+            };
+            let rotation = scw.rotation().cast::<f32>();
+            let similarity = nalgebra::Similarity3::from_parts(
+                Translation3::from(scw.translation().cast::<f32>()),
+                rotation,
+                scw.scale() as f32,
+            );
+            let mut replacements = vec![None; points.len()];
+            matcher.fuse_by_sim3(keyframe, &similarity, points, 4.0, &mut replacements);
+            for (source, replacement) in points.iter().zip(replacements) {
+                if let Some(replacement) = replacement
+                    && !source.is_bad()
+                    && source.id != replacement.id
+                {
+                    source.replace(&replacement);
+                    total += 1;
+                }
+            }
+        }
+        total
+    }
+
+    fn loop_neighborhood(keyframe: &Arc<KeyFrame>) -> Vec<Arc<KeyFrame>> {
+        let mut keyframes = vec![keyframe.clone()];
+        keyframes.extend(keyframe.get_best_covisibility_keyframes(10));
+        keyframes
+    }
+
+    fn loop_points(keyframes: &[Arc<KeyFrame>]) -> Vec<Arc<MapPoint>> {
+        let mut seen = HashSet::new();
+        keyframes
+            .iter()
+            .flat_map(|keyframe| keyframe.get_map_points())
+            .filter(|point| !point.is_bad())
+            .filter(|point| seen.insert(point.id))
+            .collect()
+    }
+
+    fn common_map_point_count(left: &KeyFrame, right: &KeyFrame) -> usize {
+        let left: HashSet<_> = left.get_map_points().into_iter().map(|mp| mp.id).collect();
+        right
+            .get_map_points()
+            .into_iter()
+            .filter(|mp| left.contains(&mp.id))
+            .count()
+    }
 }
 
-struct AtlasKeyFrameView {
+pub(crate) struct AtlasKeyFrameView {
     key_frames: HashMap<KeyFrameId, Arc<KeyFrame>>,
     bad_maps: HashSet<MapId>,
 }
 
 impl AtlasKeyFrameView {
-    fn from_atlas(atlas: &Atlas) -> Self {
+    pub(crate) fn from_atlas(atlas: &Atlas) -> Self {
         let key_frames = atlas
             .get_atlas_key_frames()
             .into_iter()
@@ -402,5 +536,33 @@ impl KeyFrameView for AtlasKeyFrameView {
                     .collect()
             })
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::key_frame::KeyFrame;
+    use crate::test_helpers::{build_frame, dummy_voc};
+
+    #[test]
+    fn reset_active_map_drops_only_queued_keyframes_from_that_map() {
+        let atlas = Arc::new(Atlas::from_kf_id(0));
+        let vocabulary = dummy_voc();
+        let database = Arc::new(KeyFrameDatabase::new(vocabulary.clone()));
+        let loop_closing = LoopClosing::new(atlas, database, vocabulary, true, true);
+        let map_a = Arc::new(Map::new());
+        let map_b = Arc::new(Map::new());
+        let keyframe_a = KeyFrame::from_frame(&build_frame(), map_a.clone());
+        let keyframe_b = KeyFrame::from_frame(&build_frame(), map_b);
+        loop_closing.insert_key_frame(keyframe_a);
+        loop_closing.insert_key_frame(keyframe_b.clone());
+
+        *loop_closing.reset_active_map.lock().unwrap() = Some(map_a);
+        loop_closing.reset_if_requested();
+
+        let queue = loop_closing.key_frames.lock().unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].id, keyframe_b.id);
     }
 }

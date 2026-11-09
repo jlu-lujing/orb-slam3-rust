@@ -996,9 +996,14 @@ impl Frame {
     pub fn set_new_bias(&mut self, b: Bias) {
         self.imu_bias = b;
         if let Some(preint) = self.imu_preintegrated.as_ref() {
-            // `Preintegrated` mutation through a shared `Arc` is part of the
-            // wider interior-mutability decision; this is a no-op stub until then.
-            let _ = preint;
+            let mut updated = preint.as_ref().clone();
+            updated.set_new_bias(&b);
+            self.imu_preintegrated = Some(Arc::new(updated));
+        }
+        if let Some(preint) = self.imu_preintegrated_frame.as_ref() {
+            let mut updated = preint.as_ref().clone();
+            updated.set_new_bias(&b);
+            self.imu_preintegrated_frame = Some(Arc::new(updated));
         }
     }
 
@@ -2032,6 +2037,25 @@ mod tests {
             [-1.038241386, -1.966795921, -3.020858765],
             1e-4,
         );
+    }
+
+    #[test]
+    fn set_new_bias_propagates_to_preintegration() {
+        let mut frame = build_frame();
+        let calibration = make_calib();
+        frame.imu_preintegrated = Some(Arc::new(Preintegrated::from_bias_and_calib(
+            &Bias::empty(),
+            &calibration,
+        )));
+        let updated = Bias::from_params(0.1, 0.2, 0.3, 0.4, 0.5, 0.6);
+        frame.set_new_bias(updated);
+        let bias = frame.imu_preintegrated.as_ref().unwrap().get_updated_bias();
+        assert_eq!(bias.bax, 0.1);
+        assert_eq!(bias.bay, 0.2);
+        assert_eq!(bias.baz, 0.3);
+        assert_eq!(bias.bwx, 0.4);
+        assert_eq!(bias.bwy, 0.5);
+        assert_eq!(bias.bwz, 0.6);
     }
 
     #[test]

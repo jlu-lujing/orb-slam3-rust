@@ -1640,34 +1640,49 @@ fn imu_cam_pose_full(
     ImuCamPose::new(rcw, tcw, rbc.to_vec(), tbc.to_vec(), bf, cameras.to_vec())
 }
 
-/// Gather inertial pose-only observations from a frame (left mono / stereo;
-/// fisheye-rig right-camera observations are not yet gathered). Mirrors the
+/// Gather inertial pose-only observations from a frame. Monocular and
+/// rectified-stereo frames use camera 0; a fisheye rig uses camera 0 for the
+/// left keypoints and camera 1 for the right keypoints. Mirrors the
 /// per-keypoint branching in `PoseInertialOptimization*`.
 fn gather_inertial_pose_obs(frame: &Frame) -> Vec<InertialPoseObs> {
     let mut obs = Vec::with_capacity(frame.n);
-    let has_rig = frame.camera2.is_some();
-    let n_left = frame.n_left.unwrap_or(0);
+    let rig = frame.camera2.as_ref().zip(frame.n_left);
     for i in 0..frame.n {
         let Some(mp) = frame.map_points[i].clone() else {
             continue;
         };
         let xw = mp.get_world_pos().cast::<f64>();
         let td = mp.track_depth();
-        if has_rig && i >= n_left {
-            continue; // rig right-camera path not yet gathered
-        }
-        let kp = &frame.keys_un.as_ref().unwrap_or(&frame.keys)[i];
+        let (kp, cam_idx) = if let Some((_, n_left)) = rig {
+            if i < n_left {
+                (&frame.keys[i], 0)
+            } else {
+                let Some(keys_right) = frame.keys_right.as_ref() else {
+                    continue;
+                };
+                let Some(kp) = keys_right.get(i - n_left) else {
+                    continue;
+                };
+                (kp, 1)
+            }
+        } else {
+            let Some(kp) = frame.keys_un.as_ref().unwrap_or(&frame.keys).get(i) else {
+                continue;
+            };
+            (kp, 0)
+        };
         let inv_sigma2 = frame.inv_level_sigma2[kp.octave() as usize] as f64;
         let o = Vector2::new(kp.pt().x as f64, kp.pt().y as f64);
+        // Upstream uses the left camera's uncertainty for both rig cameras.
         let unc2 = frame.camera.uncertainty(&o) as f64;
         let inv_sigma2 = inv_sigma2 / unc2;
-        if frame.u_right[i] < 0.0 {
+        if rig.is_some() || frame.u_right[i] < 0.0 {
             obs.push(InertialPoseObs::Mono {
                 xw,
                 obs: o,
                 inv_sigma2,
                 track_depth: td,
-                cam_idx: 0,
+                cam_idx,
                 idx: i,
             });
         } else {
@@ -1675,7 +1690,7 @@ fn gather_inertial_pose_obs(frame: &Frame) -> Vec<InertialPoseObs> {
                 xw,
                 obs: Vector3::new(o[0], o[1], frame.u_right[i] as f64),
                 inv_sigma2,
-                cam_idx: 0,
+                cam_idx,
                 idx: i,
             });
         }
@@ -1704,6 +1719,35 @@ fn frame_extrinsics(frame: &Frame) -> (nalgebra::Matrix3<f64>, Vector3<f64>) {
         .cast::<f64>();
     let tbc = frame.imu_calib.tbc.translation.vector.cast::<f64>();
     (rbc, tbc)
+}
+
+/// Camera models and body-frame extrinsics for the frame's one or two cameras.
+struct FrameCameraGeometry {
+    cameras: Vec<Arc<dyn GeometricCamera>>,
+    rbc: Vec<nalgebra::Matrix3<f64>>,
+    tbc: Vec<Vector3<f64>>,
+}
+
+fn frame_camera_geometry(frame: &Frame) -> FrameCameraGeometry {
+    let (rbc_left, tbc_left) = frame_extrinsics(frame);
+    let mut cameras = vec![frame.camera.clone()];
+    let mut rbc = vec![rbc_left];
+    let mut tbc = vec![tbc_left];
+    if let Some(camera2) = frame.camera2.as_ref() {
+        let trl = frame.get_relative_pose_trl();
+        let rrl = trl.rotation.to_rotation_matrix().into_inner().cast::<f64>();
+        let trl = trl.translation.vector.cast::<f64>();
+        let rcb_left = rbc_left.transpose();
+        let tcb_left = -rcb_left * tbc_left;
+        let rcb_right = rrl * rcb_left;
+        let tcb_right = rrl * tcb_left + trl;
+        let rbc_right = rcb_right.transpose();
+        let tbc_right = -rbc_right * tcb_right;
+        cameras.push(camera2.clone());
+        rbc.push(rbc_right);
+        tbc.push(tbc_right);
+    }
+    FrameCameraGeometry { cameras, rbc, tbc }
 }
 
 fn apply_pose_inertial_result(frame: &mut Frame, res: &PoseInertialResult) {
@@ -1745,9 +1789,8 @@ pub fn pose_inertial_optimization_last_keyframe(frame: &mut Frame, b_rec_init: b
         bg: Vector3::new(lb.bwx as f64, lb.bwy as f64, lb.bwz as f64),
         ba: Vector3::new(lb.bax as f64, lb.bay as f64, lb.baz as f64),
     };
-    let (rbc, tbc) = frame_extrinsics(frame);
+    let geometry = frame_camera_geometry(frame);
     let bf = frame.b_fx as f64;
-    let camera = frame.camera.clone();
     let obs = gather_inertial_pose_obs(frame);
 
     let res = pose_inertial_optimization_last_kf_core(
@@ -1755,9 +1798,9 @@ pub fn pose_inertial_optimization_last_keyframe(frame: &mut Frame, b_rec_init: b
         &last,
         preint,
         &obs,
-        &[camera],
-        &[rbc],
-        &[tbc],
+        &geometry.cameras,
+        &geometry.rbc,
+        &geometry.tbc,
         bf,
         b_rec_init,
     );
@@ -1801,9 +1844,8 @@ pub fn pose_inertial_optimization_last_frame(frame: &mut Frame, b_rec_init: bool
 
     let cur = imu_state_from_frame(frame);
     let prev = imu_state_from_frame(&prev_frame);
-    let (rbc, tbc) = frame_extrinsics(frame);
+    let geometry = frame_camera_geometry(frame);
     let bf = frame.b_fx as f64;
-    let camera = frame.camera.clone();
     let obs = gather_inertial_pose_obs(frame);
 
     let res = pose_inertial_optimization_last_frame_core(
@@ -1814,9 +1856,9 @@ pub fn pose_inertial_optimization_last_frame(frame: &mut Frame, b_rec_init: bool
         info_a,
         &prev_cpi,
         &obs,
-        &[camera],
-        &[rbc],
-        &[tbc],
+        &geometry.cameras,
+        &geometry.rbc,
+        &geometry.tbc,
         bf,
         b_rec_init,
     );
@@ -2505,6 +2547,28 @@ pub struct InertialBaResult {
     pub err_end: f64,
 }
 
+/// Optional behavior for [`inertial_ba_core_with_options`].
+#[derive(Debug, Clone, Copy)]
+pub struct InertialBaOptions {
+    /// Share one gyro and accelerometer bias vertex across all keyframes
+    /// (`FullInertialBA(..., bInit=true)`).
+    pub shared_bias: bool,
+    /// Information weight of the shared gyro-bias prior (zero disables it).
+    pub prior_g: f64,
+    /// Information weight of the shared accelerometer-bias prior.
+    pub prior_a: f64,
+}
+
+impl Default for InertialBaOptions {
+    fn default() -> Self {
+        Self {
+            shared_bias: false,
+            prior_g: 0.0,
+            prior_a: 0.0,
+        }
+    }
+}
+
 /// Shared core for the inertial bundle-adjustment routines (`FullInertialBA`,
 /// `LocalInertialBA`, `MergeInertialBA`): keyframe pose/velocity/bias vertices,
 /// `EdgeInertial` + bias random-walk links, reprojection edges to marginalized
@@ -2519,6 +2583,30 @@ pub fn inertial_ba_core(
     user_lambda_init: f64,
     stop_flag: Option<Arc<AtomicBool>>,
 ) -> InertialBaResult {
+    inertial_ba_core_with_options(
+        kfs,
+        links,
+        points,
+        obs,
+        n_iterations,
+        user_lambda_init,
+        stop_flag,
+        InertialBaOptions::default(),
+    )
+}
+
+/// [`inertial_ba_core`] with explicit shared-bias / prior behavior.
+#[allow(clippy::too_many_arguments)]
+pub fn inertial_ba_core_with_options(
+    kfs: &[InertialBaKf],
+    links: &[InertialLink],
+    points: &[Vector3<f64>],
+    obs: &[InertialBaObs],
+    n_iterations: i32,
+    user_lambda_init: f64,
+    stop_flag: Option<Arc<AtomicBool>>,
+    options: InertialBaOptions,
+) -> InertialBaResult {
     let mut opt = SparseOptimizer::new();
     if user_lambda_init > 0.0 {
         opt.set_user_lambda_init(user_lambda_init);
@@ -2530,8 +2618,8 @@ pub fn inertial_ba_core(
     struct KfV {
         vp: usize,
         vv: usize,
-        vg: usize,
-        va: usize,
+        vg: Option<usize>,
+        va: Option<usize>,
     }
     let mut kfv = Vec::with_capacity(kfs.len());
     for kf in kfs {
@@ -2548,47 +2636,86 @@ pub fn inertial_ba_core(
         let mut vv = VertexVelocity::new(kf.state.vel);
         vv.set_fixed(kf.fixed);
         let vv = opt.add_vertex(Box::new(vv));
-        let mut vg = VertexGyroBias::new(kf.state.bg);
-        vg.set_fixed(kf.fixed);
-        let vg = opt.add_vertex(Box::new(vg));
-        let mut va = VertexAccBias::new(kf.state.ba);
-        va.set_fixed(kf.fixed);
-        let va = opt.add_vertex(Box::new(va));
+        let (vg, va) = if options.shared_bias {
+            (None, None)
+        } else {
+            let mut vg = VertexGyroBias::new(kf.state.bg);
+            vg.set_fixed(kf.fixed);
+            let vg = opt.add_vertex(Box::new(vg));
+            let mut va = VertexAccBias::new(kf.state.ba);
+            va.set_fixed(kf.fixed);
+            let va = opt.add_vertex(Box::new(va));
+            (Some(vg), Some(va))
+        };
         kfv.push(KfV { vp, vv, vg, va });
     }
 
+    let shared_vg = if options.shared_bias && !kfs.is_empty() {
+        let vg = VertexGyroBias::new(kfs[kfs.len() - 1].state.bg);
+        let vg = opt.add_vertex(Box::new(vg));
+        if options.prior_g > 0.0 {
+            let mut prior = EdgeBiasPrior::new_gyro(vg, Vector3::zeros());
+            prior.set_information(nalgebra::Matrix3::identity() * options.prior_g);
+            opt.add_edge(Box::new(prior));
+        }
+        Some(vg)
+    } else {
+        None
+    };
+    let shared_va = if options.shared_bias && !kfs.is_empty() {
+        let va = VertexAccBias::new(kfs[kfs.len() - 1].state.ba);
+        let va = opt.add_vertex(Box::new(va));
+        if options.prior_a > 0.0 {
+            let mut prior = EdgeBiasPrior::new_acc(va, Vector3::zeros());
+            prior.set_information(nalgebra::Matrix3::identity() * options.prior_a);
+            opt.add_edge(Box::new(prior));
+        }
+        Some(va)
+    } else {
+        None
+    };
+
     for link in links {
         let (p, c) = (&kfv[link.prev], &kfv[link.cur]);
-        let mut ei = EdgeInertial::new([p.vp, p.vv, p.vg, p.va, c.vp, c.vv], link.preint.clone());
+        let vg_prev = shared_vg.or(p.vg).expect("gyro-bias vertex exists");
+        let va_prev = shared_va.or(p.va).expect("acc-bias vertex exists");
+        let vg_cur = shared_vg.or(c.vg).expect("gyro-bias vertex exists");
+        let va_cur = shared_va.or(c.va).expect("acc-bias vertex exists");
+        let mut ei = EdgeInertial::new(
+            [p.vp, p.vv, vg_prev, va_prev, c.vp, c.vv],
+            link.preint.clone(),
+        );
         if link.info_scale != 1.0 {
             ei.scale_information(link.info_scale);
         }
         ei.set_robust_kernel(link.robust_delta);
         opt.add_edge(Box::new(ei));
 
-        let info_g: nalgebra::Matrix3<f64> = link
-            .preint
-            .c
-            .fixed_view::<3, 3>(9, 9)
-            .into_owned()
-            .cast::<f64>()
-            .try_inverse()
-            .unwrap();
-        let mut egr = EdgeBiasRW::new_gyro(p.vg, c.vg);
-        egr.set_information(info_g);
-        opt.add_edge(Box::new(egr));
+        if !options.shared_bias {
+            let info_g: nalgebra::Matrix3<f64> = link
+                .preint
+                .c
+                .fixed_view::<3, 3>(9, 9)
+                .into_owned()
+                .cast::<f64>()
+                .try_inverse()
+                .unwrap();
+            let mut egr = EdgeBiasRW::new_gyro(vg_prev, vg_cur);
+            egr.set_information(info_g);
+            opt.add_edge(Box::new(egr));
 
-        let info_a: nalgebra::Matrix3<f64> = link
-            .preint
-            .c
-            .fixed_view::<3, 3>(12, 12)
-            .into_owned()
-            .cast::<f64>()
-            .try_inverse()
-            .unwrap();
-        let mut ear = EdgeBiasRW::new_acc(p.va, c.va);
-        ear.set_information(info_a);
-        opt.add_edge(Box::new(ear));
+            let info_a: nalgebra::Matrix3<f64> = link
+                .preint
+                .c
+                .fixed_view::<3, 3>(12, 12)
+                .into_owned()
+                .cast::<f64>()
+                .try_inverse()
+                .unwrap();
+            let mut ear = EdgeBiasRW::new_acc(va_prev, va_cur);
+            ear.set_information(info_a);
+            opt.add_edge(Box::new(ear));
+        }
     }
 
     let th_mono = 5.991_f64.sqrt();
@@ -2664,13 +2791,13 @@ pub fn inertial_ba_core(
                     .unwrap()
                     .estimate(),
                 bg: opt
-                    .vertex(k.vg)
+                    .vertex(k.vg.or(shared_vg).expect("gyro-bias vertex exists"))
                     .as_any()
                     .downcast_ref::<VertexGyroBias>()
                     .unwrap()
                     .estimate(),
                 ba: opt
-                    .vertex(k.va)
+                    .vertex(k.va.or(shared_va).expect("acc-bias vertex exists"))
                     .as_any()
                     .downcast_ref::<VertexAccBias>()
                     .unwrap()
@@ -2738,15 +2865,14 @@ fn imu_state_to_tcw(
     Isometry3::from_parts(nalgebra::Translation3::from(tcw.cast::<f32>()), q)
 }
 
-/// `Optimizer::FullInertialBA` (Optimizer.cc:392), non-init path (per-keyframe
-/// bias). Inertial bundle adjustment over every keyframe + map point in `map`.
-/// When `loop_kf == 0` the result is written back directly; otherwise keyframe
-/// poses / point positions are staged in their global-BA fields.
+/// `Optimizer::FullInertialBA` (Optimizer.cc:392). Inertial bundle adjustment
+/// over every keyframe and map point in `map`. When `loop_kf == 0` the result
+/// is written back directly; otherwise keyframe poses / point positions are
+/// staged in their global-BA fields.
 ///
-/// The IMU-initialization variant (`b_init`, with a single shared bias vertex +
-/// bias priors) is not yet wired here; the underlying [`inertial_ba_core`]
-/// already validates the shared per-keyframe-bias numerics. (`vSingVal`/`bHess`
-/// in the C++ signature are dead outputs and are omitted.)
+/// `b_fix_local` honors the `mnBALocalForKF` / `mnBAFixedForKF` markers exactly
+/// as upstream. `b_init` creates one shared gyro/accel bias vertex and applies
+/// the supplied zero-bias priors instead of per-keyframe bias vertices.
 #[allow(clippy::too_many_arguments)]
 pub fn full_inertial_ba(
     map: &Map,
@@ -2755,10 +2881,9 @@ pub fn full_inertial_ba(
     loop_kf: u64,
     stop_flag: Option<Arc<AtomicBool>>,
     b_init: bool,
-    _prior_g: f32,
-    _prior_a: f32,
+    prior_g: f32,
+    prior_a: f32,
 ) {
-    let _ = b_init; // shared-bias init path not yet wired (see doc).
     let kfs_all = map.get_all_key_frames();
     let mps_all = map.get_all_map_points();
     let max_kf_id = map.get_max_kf_id();
@@ -2766,18 +2891,23 @@ pub fn full_inertial_ba(
     let mut kfs: Vec<InertialBaKf> = Vec::new();
     let mut kf_index: HashMap<u64, usize> = HashMap::new();
     let mut kf_arcs: Vec<Arc<KeyFrame>> = Vec::new();
+    let mut n_non_fixed = 0usize;
     for kf in &kfs_all {
         if kf.id > max_kf_id {
             continue;
         }
-        // bFixLocal keyframe fixing needs mnBALocalForKF/mnBAFixedForKF
-        // bookkeeping (not yet plumbed); default to the bFixLocal==false case,
-        // where no keyframe is fixed and the gauge is fixed by LM damping.
-        let _ = b_fix_local;
-        let fixed = false;
+        let fixed = b_fix_local
+            && ((kf.get_ba_local_for_kf() >= max_kf_id.saturating_sub(1))
+                || (kf.get_ba_fixed_for_kf() >= max_kf_id.saturating_sub(1)));
+        if b_fix_local && !fixed {
+            n_non_fixed += 1;
+        }
         kf_index.insert(kf.id, kfs.len());
         kfs.push(inertial_ba_kf_from(kf, fixed));
         kf_arcs.push(kf.clone());
+    }
+    if kfs.is_empty() || (b_fix_local && n_non_fixed < 3) {
+        return;
     }
 
     let mut links: Vec<InertialLink> = Vec::new();
@@ -2850,7 +2980,20 @@ pub fn full_inertial_ba(
         }
     }
 
-    let r = inertial_ba_core(&kfs, &links, &points, &obs, iterations, 1e-5, stop_flag);
+    let r = inertial_ba_core_with_options(
+        &kfs,
+        &links,
+        &points,
+        &obs,
+        iterations,
+        1e-5,
+        stop_flag,
+        InertialBaOptions {
+            shared_bias: b_init,
+            prior_g: prior_g as f64,
+            prior_a: prior_a as f64,
+        },
+    );
     let (states, out_points) = (r.states, r.points);
 
     let direct = loop_kf == 0;
@@ -3461,7 +3604,7 @@ pub type KeyFrameAndPose = HashMap<u64, Sim3>;
 /// Stub of the loop-connection map: keyframe id -> set of connected keyframe ids.
 pub type LoopConnections = HashMap<u64, HashSet<u64>>;
 
-fn sim3_from_pose(tcw: &Isometry3<f32>) -> Sim3 {
+pub(crate) fn sim3_from_pose(tcw: &Isometry3<f32>) -> Sim3 {
     Sim3::new(
         tcw.rotation.cast::<f64>(),
         tcw.translation.vector.cast::<f64>(),
@@ -3530,7 +3673,11 @@ pub fn optimize_essential_graph(
         for &id_j in conns {
             let Some(&j) = idx.get(&id_j) else { continue };
             // Keep the (cur,loop) edge unconditionally, else require min weight.
-            if (id_i != cur_kf.id || id_j != loop_kf.id) && kf_i.get_weight(&kfs[j]) < MIN_FEAT {
+            let newly_linked = kf_i.get_loop_edges().iter().any(|linked| linked.id == id_j);
+            if (id_i != cur_kf.id || id_j != loop_kf.id)
+                && !newly_linked
+                && kf_i.get_weight(&kfs[j]) < MIN_FEAT
+            {
                 continue;
             }
             let sji = vscw[j].mul(&swi);
@@ -3953,4 +4100,63 @@ pub fn pose_optimization_core(
         n_initial_correspondences - n_bad,
         flags,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use nalgebra::Vector3;
+
+    use super::*;
+    use crate::camera_models::pinhole::Pinhole;
+    use crate::map::Map;
+    use crate::map_point::MapPoint;
+    use crate::test_helpers::{build_frame, keypoint};
+
+    #[test]
+    fn inertial_pose_gathers_both_fisheye_rig_cameras() {
+        let map = Arc::new(Map::new());
+        let mut frame = build_frame();
+        let map_points = [
+            MapPoint::from_frame(&Vector3::new(0.1, 0.2, 2.0), map.clone(), &frame, 0),
+            MapPoint::from_frame(&Vector3::new(0.3, 0.4, 3.0), map.clone(), &frame, 0),
+            MapPoint::from_frame(&Vector3::new(0.5, 0.6, 4.0), map.clone(), &frame, 0),
+        ];
+
+        frame.n = 3;
+        frame.n_left = Some(2);
+        frame.n_right = Some(1);
+        frame.camera2 = Some(Arc::new(Pinhole::with_params(vec![
+            401.0, 402.0, 321.0, 241.0,
+        ])));
+        frame.keys = vec![keypoint(10.0, 11.0), keypoint(20.0, 21.0)];
+        frame.keys_right = Some(vec![keypoint(30.0, 31.0)]);
+        frame.keys_un = Some(vec![keypoint(99.0, 99.0); 3]);
+        frame.u_right = vec![15.0, -1.0, -1.0];
+        frame.map_points = map_points.into_iter().map(Some).collect();
+
+        let obs = gather_inertial_pose_obs(&frame);
+        assert_eq!(obs.len(), 3);
+        let mut cameras = Vec::new();
+        for observation in obs {
+            match observation {
+                InertialPoseObs::Mono {
+                    obs, cam_idx, idx, ..
+                } => cameras.push((idx, cam_idx, obs)),
+                InertialPoseObs::Stereo { idx, .. } => {
+                    panic!("fisheye rig observation {idx} was treated as rectified stereo")
+                }
+            }
+        }
+        assert_eq!(cameras[0].0, 0);
+        assert_eq!(cameras[0].1, 0);
+        assert_eq!(cameras[0].2, Vector2::new(10.0, 11.0));
+        assert_eq!(cameras[1].0, 1);
+        assert_eq!(cameras[1].1, 0);
+        assert_eq!(cameras[1].2, Vector2::new(20.0, 21.0));
+        assert_eq!(cameras[2].0, 2);
+        assert_eq!(cameras[2].1, 1);
+        assert_eq!(cameras[2].2, Vector2::new(30.0, 31.0));
+    }
 }

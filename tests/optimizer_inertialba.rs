@@ -13,7 +13,8 @@ use orb_slam3_rs::camera_models::pinhole::Pinhole;
 use orb_slam3_rs::g2o_core::log_so3;
 use orb_slam3_rs::imu_types::{Bias, Calib, Preintegrated};
 use orb_slam3_rs::optimizer::{
-    ImuState, InertialBaKf, InertialBaObs, InertialLink, inertial_ba_core,
+    ImuState, InertialBaKf, InertialBaObs, InertialBaOptions, InertialLink, inertial_ba_core,
+    inertial_ba_core_with_options,
 };
 
 struct Tok {
@@ -181,4 +182,64 @@ fn inertial_ba_matches_g2o() {
             (g - r).norm()
         );
     }
+}
+
+#[test]
+fn shared_initialization_bias_and_priors_match_full_inertial_ba_semantics() {
+    let camera: Arc<dyn GeometricCamera> =
+        Arc::new(Pinhole::with_params(vec![400.0, 400.0, 320.0, 240.0]));
+    let make_kf = || InertialBaKf {
+        state: ImuState {
+            rwb: Matrix3::identity(),
+            twb: Vector3::zeros(),
+            vel: Vector3::zeros(),
+            bg: Vector3::new(0.3, -0.2, 0.1),
+            ba: Vector3::new(-0.25, 0.15, 0.05),
+        },
+        fixed: true,
+        camera: camera.clone(),
+        rbc: Matrix3::identity(),
+        tbc: Vector3::zeros(),
+        bf: 0.0,
+    };
+    let kfs = [make_kf(), make_kf()];
+    let calibration = Calib::from_params(Isometry3::identity(), 1.0e-4, 1.0e-3, 1.0e-5, 1.0e-3);
+    let mut preint = Preintegrated::from_bias_and_calib(&Bias::empty(), &calibration);
+    for _ in 0..100 {
+        preint.integrate_new_measurement(Vector3::new(0.0, 0.0, 9.81), Vector3::zeros(), 0.01);
+    }
+    let links = [InertialLink {
+        prev: 0,
+        cur: 1,
+        preint: Arc::new(preint),
+        robust_delta: None,
+        info_scale: 1.0,
+    }];
+    let result = inertial_ba_core_with_options(
+        &kfs,
+        &links,
+        &[],
+        &[],
+        20,
+        0.0,
+        None,
+        InertialBaOptions {
+            shared_bias: true,
+            prior_g: 1e6,
+            prior_a: 1e6,
+        },
+    );
+
+    assert!((result.states[0].bg - result.states[1].bg).norm() < 1e-12);
+    assert!((result.states[0].ba - result.states[1].ba).norm() < 1e-12);
+    assert!(
+        result.states[0].bg.norm() < 1e-4,
+        "shared gyro bias did not converge: {:?}",
+        result.states[0].bg
+    );
+    assert!(
+        result.states[0].ba.norm() < 1e-4,
+        "shared acc bias did not converge: {:?}",
+        result.states[0].ba
+    );
 }

@@ -87,6 +87,8 @@ struct ConnState {
 
 pub struct KeyFrame {
     imu: AtomicBool,
+    ba_local_for_kf: AtomicU64,
+    ba_fixed_for_kf: AtomicU64,
 
     pub id: u64,
     pub frame_id: usize,
@@ -170,6 +172,7 @@ pub struct KeyFrame {
     map: RwLock<Weak<Map>>,
     prev_kf: RwLock<Weak<KeyFrame>>,
     next_kf: RwLock<Weak<KeyFrame>>,
+    pose_to_parent: RwLock<Option<Isometry3<f32>>>,
     /// Global-BA staging (set by `Optimizer::global_bundle_adjustment` for the
     /// loop-closing path; mirrors C++ `mTcwGBA` / `mnBAGlobalForKF`). Not
     /// serialized.
@@ -214,6 +217,8 @@ impl KeyFrame {
 
         let kf = KeyFrame {
             imu: AtomicBool::new(map.is_imu_initialized()),
+            ba_local_for_kf: AtomicU64::new(0),
+            ba_fixed_for_kf: AtomicU64::new(0),
             id: NEXT_ID.fetch_add(1, Ordering::SeqCst),
             frame_id: frame.id,
             timestamp: frame.timestamp,
@@ -288,6 +293,7 @@ impl KeyFrame {
             map: RwLock::new(Arc::downgrade(&map)),
             prev_kf: RwLock::new(Weak::new()),
             next_kf: RwLock::new(Weak::new()),
+            pose_to_parent: RwLock::new(None),
             gba: RwLock::new(KfGba::default()),
         };
 
@@ -304,6 +310,27 @@ impl KeyFrame {
 
     pub fn set_inertial(&self) {
         self.imu.store(true, Ordering::SeqCst);
+    }
+
+    /// `mnBALocalForKF`: optimization request that included this keyframe in
+    /// the local (non-fixed) subsystem.
+    pub fn get_ba_local_for_kf(&self) -> u64 {
+        self.ba_local_for_kf.load(Ordering::SeqCst)
+    }
+
+    /// Set `mnBALocalForKF` for an optimization request.
+    pub fn set_ba_local_for_kf(&self, value: u64) {
+        self.ba_local_for_kf.store(value, Ordering::SeqCst);
+    }
+
+    /// `mnBAFixedForKF`: optimization request that held this keyframe fixed.
+    pub fn get_ba_fixed_for_kf(&self) -> u64 {
+        self.ba_fixed_for_kf.load(Ordering::SeqCst)
+    }
+
+    /// Set `mnBAFixedForKF` for an optimization request.
+    pub fn set_ba_fixed_for_kf(&self, value: u64) {
+        self.ba_fixed_for_kf.store(value, Ordering::SeqCst);
     }
 
     pub fn get_imu_preintegrated(&self) -> Option<Arc<Preintegrated>> {
@@ -433,7 +460,12 @@ impl KeyFrame {
 
     pub fn set_new_bias(&self, b: Bias) {
         self.pose.write().unwrap().imu_bias = b;
-        // Preintegrated mutation through a shared `Arc` is deferred (see Frame).
+        let existing = self.imu_preintegrated.read().unwrap().clone();
+        if let Some(preint) = existing {
+            let mut updated = preint.as_ref().clone();
+            updated.set_new_bias(&b);
+            *self.imu_preintegrated.write().unwrap() = Some(Arc::new(updated));
+        }
     }
     pub fn get_gyro_bias(&self) -> Vector3<f32> {
         let b = self.pose.read().unwrap().imu_bias;
@@ -840,6 +872,8 @@ impl KeyFrame {
         }
 
         if let Some(parent) = parent {
+            *self.pose_to_parent.write().unwrap() =
+                Some(self.get_pose() * parent.get_pose_inverse());
             for child in remaining {
                 child.change_parent(&parent);
                 self.erase_child(&child);
@@ -882,6 +916,10 @@ impl KeyFrame {
     }
     pub fn get_next_kf(&self) -> Option<Arc<KeyFrame>> {
         self.next_kf.read().unwrap().upgrade()
+    }
+
+    pub fn get_pose_to_parent(&self) -> Option<Isometry3<f32>> {
+        *self.pose_to_parent.read().unwrap()
     }
 
     // --- Map ------------------------------------------------------------
@@ -1233,6 +1271,8 @@ impl KeyFrame {
     ) -> Arc<KeyFrame> {
         let kf = KeyFrame {
             imu: AtomicBool::new(b.imu),
+            ba_local_for_kf: AtomicU64::new(0),
+            ba_fixed_for_kf: AtomicU64::new(0),
             id: b.id,
             frame_id: b.frame_id,
             timestamp: b.timestamp,
@@ -1309,6 +1349,7 @@ impl KeyFrame {
             map: RwLock::new(Weak::new()),
             prev_kf: RwLock::new(Weak::new()),
             next_kf: RwLock::new(Weak::new()),
+            pose_to_parent: RwLock::new(None),
             gba: RwLock::new(KfGba::default()),
         };
         let kf = Arc::new(kf);
@@ -1619,5 +1660,31 @@ mod tests {
         assert!(a.get_loop_edges().iter().any(|k| k.id == b.id));
         a.add_merge_edge(&b);
         assert!(a.get_merge_edges().iter().any(|k| k.id == b.id));
+    }
+
+    #[test]
+    fn bad_keyframe_preserves_parent_transform_for_trajectory_export() {
+        let map = Arc::new(Map::new());
+        let parent = KeyFrame::from_frame(&build_frame(), map.clone());
+        let child = KeyFrame::from_frame(&build_frame(), map.clone());
+        map.add_key_frame(parent.clone());
+        map.add_key_frame(child.clone());
+        parent.set_pose(make_pose());
+        child.set_pose(
+            make_pose()
+                * Isometry3::from_parts(
+                    nalgebra::Translation3::new(0.2, 0.1, -0.3),
+                    nalgebra::UnitQuaternion::from_scaled_axis(Vector3::new(0.01, 0.02, 0.03)),
+                ),
+        );
+        let expected = child.get_pose() * parent.get_pose_inverse();
+        child.change_parent(&parent);
+
+        child.set_bad_flag();
+
+        let saved = child.get_pose_to_parent().expect("saved Tcp");
+        assert!(approx(saved.translation.x, expected.translation.x, 1e-6));
+        assert!(approx(saved.translation.y, expected.translation.y, 1e-6));
+        assert!(approx(saved.translation.z, expected.translation.z, 1e-6));
     }
 }

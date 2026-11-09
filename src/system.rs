@@ -1,5 +1,6 @@
 use md5::{Digest, Md5};
 use opencv::core::Mat;
+use opencv::imgproc::{INTER_LINEAR, remap, resize};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -18,9 +19,9 @@ use tracing::info;
 use crate::{
     atlas::Atlas,
     imu_types::Point,
-    key_frame_database::KeyFrameDatabase,
+    key_frame_database::{KeyFrameDatabase, MapId},
     local_mapping::LocalMapping,
-    loop_closing::LoopClosing,
+    loop_closing::{AtlasKeyFrameView, LoopClosing},
     orb_vocabulary::{OrbVocabulary, VocabularyError},
     settings::{Settings, SettingsError},
     tracking::{Tracking, TrackingState},
@@ -251,6 +252,7 @@ impl System {
         if self.shutdown.load(Ordering::SeqCst) {
             return None;
         }
+        let (image_left, image_right) = self.preprocess_stereo(image_left, image_right)?;
         let tracking = self.tracking.get()?.clone();
         let mut tracking = tracking.lock().unwrap();
         for measurement in imu_measurements {
@@ -269,6 +271,7 @@ impl System {
         if self.shutdown.load(Ordering::SeqCst) {
             return None;
         }
+        let image = self.preprocess_image(image)?;
         let tracking = self.tracking.get()?.clone();
         let mut tracking = tracking.lock().unwrap();
         for measurement in imu_measurements {
@@ -288,12 +291,119 @@ impl System {
         if self.shutdown.load(Ordering::SeqCst) {
             return None;
         }
+        let (image, depth) = self.preprocess_rgbd(image, depth)?;
         let tracking = self.tracking.get()?.clone();
         let mut tracking = tracking.lock().unwrap();
         for measurement in imu_measurements {
             tracking.grab_imu_data(Point::new(measurement.a, measurement.w, measurement.t));
         }
         tracking.grab_image_rgbd(image, depth, timestamp, filename.into())
+    }
+
+    fn preprocess_image(&self, image: Mat) -> Option<Mat> {
+        let Some(settings) = self.settings.as_ref() else {
+            return Some(image);
+        };
+        if !settings.image.need_to_resize {
+            return Some(image);
+        }
+        let mut resized = Mat::default();
+        resize(
+            &image,
+            &mut resized,
+            settings.image.new_size,
+            0.0,
+            0.0,
+            INTER_LINEAR,
+        )
+        .ok()?;
+        Some(resized)
+    }
+
+    fn preprocess_rgbd(&self, image: Mat, depth: Mat) -> Option<(Mat, Mat)> {
+        let Some(settings) = self.settings.as_ref() else {
+            return Some((image, depth));
+        };
+        if !settings.image.need_to_resize {
+            return Some((image, depth));
+        }
+        let mut resized_image = Mat::default();
+        let mut resized_depth = Mat::default();
+        resize(
+            &image,
+            &mut resized_image,
+            settings.image.new_size,
+            0.0,
+            0.0,
+            INTER_LINEAR,
+        )
+        .ok()?;
+        resize(
+            &depth,
+            &mut resized_depth,
+            settings.image.new_size,
+            0.0,
+            0.0,
+            INTER_LINEAR,
+        )
+        .ok()?;
+        Some((resized_image, resized_depth))
+    }
+
+    fn preprocess_stereo(&self, image_left: Mat, image_right: Mat) -> Option<(Mat, Mat)> {
+        let Some(settings) = self.settings.as_ref() else {
+            return Some((image_left, image_right));
+        };
+        let Some(stereo) = settings.stereo.as_ref() else {
+            return Some((image_left, image_right));
+        };
+        let mut left = Mat::default();
+        let mut right = Mat::default();
+        if settings.need_to_rectify {
+            remap(
+                &image_left,
+                &mut left,
+                &stereo.m1l,
+                &stereo.m2l,
+                INTER_LINEAR,
+                opencv::core::BORDER_CONSTANT,
+                opencv::core::Scalar::default(),
+            )
+            .ok()?;
+            remap(
+                &image_right,
+                &mut right,
+                &stereo.m1r,
+                &stereo.m2r,
+                INTER_LINEAR,
+                opencv::core::BORDER_CONSTANT,
+                opencv::core::Scalar::default(),
+            )
+            .ok()?;
+            Some((left, right))
+        } else if settings.image.need_to_resize {
+            resize(
+                &image_left,
+                &mut left,
+                settings.image.new_size,
+                0.0,
+                0.0,
+                INTER_LINEAR,
+            )
+            .ok()?;
+            resize(
+                &image_right,
+                &mut right,
+                settings.image.new_size,
+                0.0,
+                0.0,
+                INTER_LINEAR,
+            )
+            .ok()?;
+            Some((left, right))
+        } else {
+            Some((image_left, image_right))
+        }
     }
 
     pub fn grab_imu_data(&self, measurement: Point) {
@@ -384,13 +494,22 @@ impl System {
     pub fn reset_active_map(&self) {
         let current_map = self.atlas.get_current_map();
         if let Some(mapping) = self.local_mapping.get() {
-            mapping.request_reset_active_map(current_map);
+            mapping.request_reset_active_map(current_map.clone());
+        }
+        if let Some(loop_closing) = self.loop_closing.get() {
+            loop_closing.request_reset_active_map(current_map.clone());
+        }
+        if let Some(database) = self.keyframe_database.as_ref() {
+            database.clear_map(
+                &AtlasKeyFrameView::from_atlas(&self.atlas),
+                MapId(current_map.get_id() as u64),
+            );
         }
         self.atlas.clear_map();
         if let Some(tracking) = self.tracking.get()
             && let Ok(mut tracking) = tracking.lock()
         {
-            tracking.reset_active_map();
+            tracking.reset_active_map(&current_map);
         }
         self.reset_active_map.store(false, Ordering::SeqCst);
     }
@@ -419,36 +538,95 @@ impl System {
     }
 
     pub fn save_trajectory_tum(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        if self.sensor == Sensor::Monocular {
+            return Err(unsupported_trajectory_format("TUM", self.sensor));
+        }
+        let Some(map) = self.largest_map() else {
+            return write_tum_trajectory(path, &[]);
+        };
         let trajectory = self
             .tracking
             .get()
-            .map(|tracking| tracking.lock().unwrap().frame_trajectory())
+            .map(|tracking| {
+                tracking
+                    .lock()
+                    .unwrap()
+                    .frame_trajectory_for_export(&map, false, 1.0)
+            })
             .unwrap_or_default();
         write_tum_trajectory(path, &trajectory)
     }
 
     pub fn save_keyframe_trajectory_tum(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let Some(map) = self.largest_map() else {
+            return write_tum_trajectory(path, &[]);
+        };
         let trajectory = self
             .tracking
             .get()
-            .map(|tracking| tracking.lock().unwrap().keyframe_trajectory())
+            .map(|tracking| {
+                tracking
+                    .lock()
+                    .unwrap()
+                    .keyframe_trajectory_for_export(&map, false, 1.0, false)
+            })
             .unwrap_or_default();
         write_tum_trajectory(path, &trajectory)
     }
 
     pub fn save_trajectory_euroc(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        self.save_trajectory_tum(path)
-    }
-
-    pub fn save_keyframe_trajectory_euroc(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        self.save_keyframe_trajectory_tum(path)
-    }
-
-    pub fn save_trajectory_kitti(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let Some(map) = self.largest_map() else {
+            return write_tum_trajectory(path, &[]);
+        };
         let trajectory = self
             .tracking
             .get()
-            .map(|tracking| tracking.lock().unwrap().frame_trajectory())
+            .map(|tracking| {
+                tracking.lock().unwrap().frame_trajectory_for_export(
+                    &map,
+                    self.uses_imu_body_trajectory(),
+                    1e9,
+                )
+            })
+            .unwrap_or_default();
+        write_tum_trajectory(path, &trajectory)
+    }
+
+    pub fn save_keyframe_trajectory_euroc(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let Some(map) = self.largest_map() else {
+            return write_tum_trajectory(path, &[]);
+        };
+        let trajectory = self
+            .tracking
+            .get()
+            .map(|tracking| {
+                tracking.lock().unwrap().keyframe_trajectory_for_export(
+                    &map,
+                    self.uses_imu_body_trajectory(),
+                    1e9,
+                    false,
+                )
+            })
+            .unwrap_or_default();
+        write_tum_trajectory(path, &trajectory)
+    }
+
+    pub fn save_trajectory_kitti(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        if self.sensor == Sensor::Monocular {
+            return Err(unsupported_trajectory_format("KITTI", self.sensor));
+        }
+        let Some(map) = self.largest_map() else {
+            return Ok(());
+        };
+        let trajectory = self
+            .tracking
+            .get()
+            .map(|tracking| {
+                tracking
+                    .lock()
+                    .unwrap()
+                    .frame_trajectory_for_export(&map, false, 1.0)
+            })
             .unwrap_or_default();
         let mut file = File::create(path)?;
         for (_, pose) in trajectory {
@@ -472,6 +650,20 @@ impl System {
             )?;
         }
         Ok(())
+    }
+
+    fn largest_map(&self) -> Option<Arc<crate::map::Map>> {
+        self.atlas
+            .get_all_maps()
+            .into_iter()
+            .max_by_key(|map| map.key_frames_in_map())
+    }
+
+    fn uses_imu_body_trajectory(&self) -> bool {
+        matches!(
+            self.sensor,
+            Sensor::IMUMonocular | Sensor::IMUStereo | Sensor::IMURGBD
+        )
     }
 
     pub fn save_atlas(&self, path: impl AsRef<Path>) -> Result<(), SystemSaveError> {
@@ -601,11 +793,18 @@ fn write_tum_trajectory(
         let q = pose.rotation.quaternion();
         writeln!(
             file,
-            "{timestamp:.9} {:.9} {:.9} {:.9} {:.9} {:.9} {:.9} {:.9}",
+            "{timestamp:.6} {:.9} {:.9} {:.9} {:.9} {:.9} {:.9} {:.9}",
             t.x, t.y, t.z, q.i, q.j, q.k, q.w
         )?;
     }
     Ok(())
+}
+
+fn unsupported_trajectory_format(format: &str, sensor: Sensor) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{format} trajectory export cannot be used for {sensor:?}"),
+    )
 }
 
 fn load_atlas(
@@ -649,4 +848,78 @@ pub fn calculate_checksum(filename: impl AsRef<Path>) -> io::Result<String> {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     Ok(checksum)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opencv::core::{CV_8UC1, MatTraitConst, Scalar};
+
+    use crate::key_frame::KeyFrame;
+    use crate::key_frame_database::KeyFrameId;
+    use crate::orb_vocabulary::{BowVector, OrbVocabulary};
+    use crate::test_helpers::build_frame;
+
+    #[test]
+    fn stereo_preprocessing_applies_rectification_maps() {
+        let settings_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/euroc.yaml");
+        let settings = Settings::new(&settings_path, Sensor::IMUStereo).expect("EuRoC settings");
+        assert!(settings.need_to_rectify);
+        let expected_size = settings.image.new_size;
+
+        let mut system = System::new_for_test(Sensor::IMUStereo);
+        system.settings = Some(Arc::new(settings));
+        let left = Mat::new_rows_cols_with_default(480, 752, CV_8UC1, Scalar::all(80.0))
+            .expect("left image");
+        let right = Mat::new_rows_cols_with_default(480, 752, CV_8UC1, Scalar::all(120.0))
+            .expect("right image");
+        let (left, right) = system
+            .preprocess_stereo(left, right)
+            .expect("rectification");
+        assert_eq!(left.size().expect("left size"), expected_size);
+        assert_eq!(right.size().expect("right size"), expected_size);
+        assert!(!left.empty());
+        assert!(!right.empty());
+    }
+
+    #[test]
+    fn reset_active_map_clears_database_before_dropping_keyframes() {
+        let mut system = System::new_for_test(Sensor::Stereo);
+        let map = system.atlas.get_current_map();
+        let keyframe = KeyFrame::from_frame(&build_frame(), map.clone());
+        map.add_key_frame(keyframe.clone());
+
+        let mut vocabulary_text = String::from("1 1 0 0\n0 1 ");
+        for _ in 0..crate::orb_vocabulary::DESC_LEN {
+            vocabulary_text.push_str("0 ");
+        }
+        vocabulary_text.push_str("1.0\n");
+        let vocabulary = Arc::new(
+            OrbVocabulary::load_from_reader(vocabulary_text.as_bytes())
+                .expect("one-word vocabulary"),
+        );
+        let database = Arc::new(KeyFrameDatabase::new(vocabulary));
+        let bow = BowVector([(0, 1.0)].into());
+        database.add(KeyFrameId(keyframe.id), &bow);
+        assert!(database._entry_count() > 0);
+        system.keyframe_database = Some(database.clone());
+
+        system.reset_active_map();
+
+        assert_eq!(map.key_frames_in_map(), 0);
+        assert_eq!(database._entry_count(), 0);
+        assert!(!system.reset_active_map.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn trajectory_sensor_semantics_match_upstream_exports() {
+        let inertial = System::new_for_test(Sensor::IMUStereo);
+        assert!(inertial.uses_imu_body_trajectory());
+        let stereo = System::new_for_test(Sensor::Stereo);
+        assert!(!stereo.uses_imu_body_trajectory());
+
+        let mono = System::new_for_test(Sensor::Monocular);
+        assert!(mono.save_trajectory_tum("unused.txt").is_err());
+        assert!(mono.save_trajectory_kitti("unused.txt").is_err());
+    }
 }

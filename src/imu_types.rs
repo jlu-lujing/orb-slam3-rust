@@ -43,6 +43,7 @@ pub fn inverse_right_jacobian_so3_xyz(x: f32, y: f32, z: f32) -> Matrix3<f32> {
 }
 
 // IMU measurement (gyro, accelerometer and timestamp)
+#[derive(Clone)]
 pub struct Point {
     pub a: Vector3<f32>,
     pub w: Vector3<f32>,
