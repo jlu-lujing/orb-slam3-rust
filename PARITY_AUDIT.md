@@ -70,13 +70,13 @@ match:
    Jacobian is replaced by finite differences; OpenCV EPnP remains only as a
    fallback when the MLPnP estimate has no valid solution.
 2. **Loop candidate continuity.** A loop now requires three distinct,
-   consecutive current keyframes to select the same candidate. The full
-   ORB-SLAM3 common-region search across the previous loop group, including
-   candidate-side continuity and retry bookkeeping, is still simplified.
+   consecutive current keyframes to select the same or an overlapping candidate
+   neighborhood. The full ORB-SLAM3 retry bookkeeping and every common-region
+   refinement branch are still simplified.
 3. **Map merge completeness.** Merge now moves contents, adds the loop edge,
    optionally runs inertial merge BA, and rebuilds connections. It does not yet
-   reproduce every corrected-pose, duplicate-fusion, map-origin-id, and
-   synchronization step of `MergeLocal`.
+   reproduce every corrected local-window pose and spanning-tree rewiring step
+   of `MergeLocal`.
 4. **Accuracy parity.** No real EuRoC/TUM/KITTI trajectory was available in this
    workspace. The synthetic EuRoC smoke test validates execution and exports,
    not ATE/RPE parity.

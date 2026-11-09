@@ -89,7 +89,8 @@ cargo run --features gui --bin slam_viewer -- \
 The viewer runs SLAM on a worker thread and displays the current image and ORB
 features, map points, keyframes, covisibility graph, and current camera pose.
 It supports localization mode, reset, orbit/zoom navigation, track following,
-and trajectory/Atlas export.
+left/right fisheye image display, inertial and loop graph overlays, single-step
+debugging, drag-and-drop sequence loading, and trajectory/Atlas export.
 
 The original C++ implementation is available at `3rdparty/ORB_SLAM3` as a Git
 submodule:

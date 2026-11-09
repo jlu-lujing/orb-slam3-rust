@@ -41,9 +41,9 @@ pub struct LoopClosing {
     gba_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PendingMatch {
-    candidate_id: u64,
+    candidate_group: HashSet<u64>,
     last_current_id: u64,
     count: u8,
 }
@@ -184,7 +184,13 @@ impl LoopClosing {
             for candidate in candidates.loop_ {
                 if let Some(loop_kf) = view.key_frames.get(&candidate).cloned()
                     && let Some(sim3) = self.detect_sim3(&current, &loop_kf)
-                    && self.confirm_candidate(current.id, loop_kf.id)
+                    && self.confirm_candidate(
+                        current.id,
+                        &Self::loop_neighborhood(&loop_kf)
+                            .into_iter()
+                            .map(|keyframe| keyframe.id)
+                            .collect(),
+                    )
                 {
                     tracing::info!(
                         "Loop detected: current KF {} matched KF {}",
@@ -198,7 +204,13 @@ impl LoopClosing {
             for candidate in candidates.merge {
                 if let Some(merge_kf) = view.key_frames.get(&candidate).cloned()
                     && let Some(sim3) = self.detect_sim3(&current, &merge_kf)
-                    && self.confirm_candidate(current.id, merge_kf.id)
+                    && self.confirm_candidate(
+                        current.id,
+                        &Self::loop_neighborhood(&merge_kf)
+                            .into_iter()
+                            .map(|keyframe| keyframe.id)
+                            .collect(),
+                    )
                 {
                     self.merge_maps(&current, &merge_kf, sim3);
                     break;
@@ -207,11 +219,11 @@ impl LoopClosing {
         }
     }
 
-    fn confirm_candidate(&self, current_id: u64, candidate_id: u64) -> bool {
+    fn confirm_candidate(&self, current_id: u64, candidate_group: &HashSet<u64>) -> bool {
         let mut pending = self.pending_match.lock().unwrap();
-        let count = match *pending {
+        let count = match pending.as_ref() {
             Some(previous)
-                if previous.candidate_id == candidate_id
+                if !previous.candidate_group.is_disjoint(candidate_group)
                     && current_id > previous.last_current_id =>
             {
                 previous.count.saturating_add(1)
@@ -223,7 +235,7 @@ impl LoopClosing {
             true
         } else {
             *pending = Some(PendingMatch {
-                candidate_id,
+                candidate_group: candidate_group.clone(),
                 last_current_id: current_id,
                 count,
             });
@@ -639,12 +651,30 @@ mod tests {
         let vocabulary = dummy_voc();
         let database = Arc::new(KeyFrameDatabase::new(vocabulary.clone()));
         let loop_closing = LoopClosing::new(atlas, database, vocabulary, true, true);
+        let group = HashSet::from([2]);
 
-        assert!(!loop_closing.confirm_candidate(10, 2));
-        assert!(!loop_closing.confirm_candidate(10, 2));
-        assert!(!loop_closing.confirm_candidate(11, 2));
-        assert!(loop_closing.confirm_candidate(12, 2));
-        assert!(!loop_closing.confirm_candidate(13, 2));
+        assert!(!loop_closing.confirm_candidate(10, &group));
+        assert!(!loop_closing.confirm_candidate(10, &group));
+        assert!(!loop_closing.confirm_candidate(11, &group));
+        assert!(loop_closing.confirm_candidate(12, &group));
+        assert!(!loop_closing.confirm_candidate(13, &group));
+    }
+
+    #[test]
+    fn loop_confirmation_accepts_overlapping_candidate_neighborhoods() {
+        let atlas = Arc::new(Atlas::from_kf_id(0));
+        let vocabulary = dummy_voc();
+        let database = Arc::new(KeyFrameDatabase::new(vocabulary.clone()));
+        let loop_closing = LoopClosing::new(atlas, database, vocabulary, true, true);
+        let first = HashSet::from([2, 3, 4]);
+        let overlapping = HashSet::from([4, 5, 6]);
+        let disjoint = HashSet::from([20, 21, 22]);
+
+        assert!(!loop_closing.confirm_candidate(10, &first));
+        assert!(!loop_closing.confirm_candidate(11, &overlapping));
+        assert!(!loop_closing.confirm_candidate(12, &disjoint));
+        assert!(!loop_closing.confirm_candidate(13, &disjoint));
+        assert!(loop_closing.confirm_candidate(14, &disjoint));
     }
 
     #[test]

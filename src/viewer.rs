@@ -81,6 +81,8 @@ pub struct ViewerKeyFrame {
     pub pose: Isometry3<f32>,
     pub parent: Option<u64>,
     pub connections: Vec<u64>,
+    pub loop_edges: Vec<u64>,
+    pub next_keyframe: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -89,12 +91,14 @@ pub struct ViewerFeature {
     pub y: f32,
     pub has_map_point: bool,
     pub outlier: bool,
+    pub right: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct ViewerSnapshot {
     pub state: TrackingState,
     pub image: Option<ViewerImage>,
+    pub image_right: Option<ViewerImage>,
     pub current_pose: Option<Isometry3<f32>>,
     pub map_points: Vec<Vector3<f32>>,
     pub keyframes: Vec<ViewerKeyFrame>,

@@ -1834,33 +1834,40 @@ impl Tracking {
                 pose: keyframe.get_pose(),
                 parent: keyframe.get_parent().map(|parent| parent.id),
                 connections: keyframe
-                    .get_vector_covisible_keyframes()
+                    .get_covisibles_by_weight(100)
                     .into_iter()
                     .map(|connected| connected.id)
                     .collect(),
+                loop_edges: keyframe
+                    .get_loop_edges()
+                    .into_iter()
+                    .map(|connected| connected.id)
+                    .collect(),
+                next_keyframe: keyframe.get_next_kf().map(|next| next.id),
             })
             .collect::<Vec<_>>();
         let current = self.current_frame.as_ref();
         let features = current
             .map(|frame| {
-                let count = frame.n_left.unwrap_or(frame.n);
-                (0..count)
+                (0..frame.n)
                     .filter_map(|index| {
-                        let x = if frame.n_left.is_none() {
-                            frame.keys_un.as_ref()?.get(index)?.pt().x
+                        let n_left = frame.n_left.unwrap_or(frame.n);
+                        let (keypoint, right) = if index < n_left {
+                            let keypoint = if frame.n_left.is_none() {
+                                frame.keys_un.as_ref()?.get(index)?
+                            } else {
+                                frame.keys.get(index)?
+                            };
+                            (keypoint, false)
                         } else {
-                            frame.keys.get(index)?.pt().x
-                        };
-                        let y = if frame.n_left.is_none() {
-                            frame.keys_un.as_ref()?.get(index)?.pt().y
-                        } else {
-                            frame.keys.get(index)?.pt().y
+                            (frame.keys_right.as_ref()?.get(index - n_left)?, true)
                         };
                         Some(ViewerFeature {
-                            x,
-                            y,
+                            x: keypoint.pt().x,
+                            y: keypoint.pt().y,
                             has_map_point: frame.map_points.get(index).is_some_and(Option::is_some),
                             outlier: frame.outlier.get(index).copied().unwrap_or(false),
+                            right,
                         })
                     })
                     .collect()
@@ -1870,6 +1877,9 @@ impl Tracking {
             state: self.state,
             image: current
                 .and_then(|frame| frame.img_left.as_ref())
+                .and_then(ViewerImage::from_mat),
+            image_right: current
+                .and_then(|frame| frame.img_right.as_ref())
                 .and_then(ViewerImage::from_mat),
             current_pose: current.map(Frame::get_pose),
             feature_count: current.map_or(0, |frame| frame.n),
