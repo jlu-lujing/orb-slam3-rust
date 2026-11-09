@@ -335,6 +335,40 @@ pub fn global_bundle_adjustment(
     bundle_adjustment(map, &kfs, &mps, n_iterations, stop_flag, loop_kf, robust);
 }
 
+/// Commit staged global-BA keyframe poses and map-point positions.
+///
+/// `global_bundle_adjustment` stores results when `loop_kf != origin`. This is
+/// the terminal commit step used by LoopClosing's background GBA thread.
+pub fn commit_global_bundle_adjustment(map: &Map, loop_kf: u64) -> usize {
+    let _update = map.map_update.lock().unwrap();
+    let mut committed = 0;
+    for keyframe in map.get_all_key_frames() {
+        if keyframe.is_bad() || keyframe.get_ba_global_for_kf() != loop_kf as i64 {
+            continue;
+        }
+        if let Some(pose) = keyframe.get_tcw_gba() {
+            keyframe.set_pose(pose);
+            committed += 1;
+        }
+    }
+    for point in map.get_all_map_points() {
+        if point.is_bad() || point.get_ba_global_for_kf() != loop_kf as i64 {
+            continue;
+        }
+        if let Some(position) = point.get_pos_gba() {
+            point.set_world_pos(position);
+            point.update_normal_and_depth();
+        }
+    }
+    for keyframe in map.get_all_key_frames() {
+        if !keyframe.is_bad() {
+            keyframe.update_connections();
+        }
+    }
+    map.increase_change_index();
+    committed
+}
+
 /// `Optimizer::BundleAdjustment` (Optimizer.cc:60).
 ///
 /// Joint optimization of the given keyframe poses and map-point positions.

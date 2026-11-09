@@ -36,6 +36,9 @@ pub struct LoopClosing {
     running_loop: AtomicBool,
     last_processed: Mutex<Option<u64>>,
     pending_match: Mutex<Option<PendingMatch>>,
+    gba_running: Arc<AtomicBool>,
+    gba_stop: Arc<AtomicBool>,
+    gba_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -68,6 +71,9 @@ impl LoopClosing {
             running_loop: AtomicBool::new(false),
             last_processed: Mutex::new(None),
             pending_match: Mutex::new(None),
+            gba_running: Arc::new(AtomicBool::new(false)),
+            gba_stop: Arc::new(AtomicBool::new(false)),
+            gba_thread: Mutex::new(None),
         }
     }
 
@@ -87,8 +93,13 @@ impl LoopClosing {
         self.running_loop.load(Ordering::SeqCst)
     }
 
+    pub fn is_running_gba(&self) -> bool {
+        self.gba_running.load(Ordering::SeqCst)
+    }
+
     pub fn request_finish(&self) {
         self.finish_requested.store(true, Ordering::SeqCst);
+        self.stop_and_join_gba();
     }
 
     pub fn request_reset(&self) {
@@ -232,7 +243,7 @@ impl LoopClosing {
             pose.translation.vector.cast::<f64>(),
             1.0,
         );
-        let points: Vec<_> = candidate.get_map_points().into_iter().collect();
+        let points = Self::loop_points(&Self::loop_neighborhood(candidate));
         let mut matches = vec![None; current.n];
         let matcher = OrbMatcher::new(0.75, true);
         if matcher.search_by_projection_similarity_loop_detection(
@@ -390,10 +401,9 @@ impl LoopClosing {
             &connections,
             self.fix_scale,
         );
-        // ORB-SLAM3 schedules a full BA after the essential-graph correction.
-        // Apply it synchronously while LocalMapping remains stopped so readers
-        // never observe a half-corrected map.
-        optimizer::global_bundle_adjustment(&map, 20, None, map.get_init_kf_id(), false);
+        // ORB-SLAM3 launches global BA in a dedicated thread after the
+        // essential-graph correction and commits its staged result later.
+        self.start_global_bundle_adjustment(map.clone(), current.id);
 
         for point in map.get_all_map_points() {
             if !point.is_bad() {
@@ -428,6 +438,40 @@ impl LoopClosing {
         }
         tracing::error!("local mapper did not stop; aborting loop-closing update");
         false
+    }
+
+    fn start_global_bundle_adjustment(&self, map: Arc<Map>, loop_kf: u64) {
+        self.stop_and_join_gba();
+        self.gba_stop.store(false, Ordering::SeqCst);
+        self.gba_running.store(true, Ordering::SeqCst);
+        let stop = self.gba_stop.clone();
+        let running = self.gba_running.clone();
+        let handle = std::thread::Builder::new()
+            .name("orb-global-ba".to_owned())
+            .spawn(move || {
+                optimizer::global_bundle_adjustment(&map, 10, Some(stop.clone()), loop_kf, false);
+                if !stop.load(Ordering::SeqCst) {
+                    optimizer::commit_global_bundle_adjustment(&map, loop_kf);
+                }
+                running.store(false, Ordering::SeqCst);
+            });
+        if let Ok(handle) = handle {
+            *self.gba_thread.lock().unwrap() = Some(handle);
+            if self.finish_requested.load(Ordering::SeqCst) {
+                self.stop_and_join_gba();
+            }
+        } else {
+            self.gba_running.store(false, Ordering::SeqCst);
+            tracing::error!("failed to start global-BA thread");
+        }
+    }
+
+    fn stop_and_join_gba(&self) {
+        self.gba_stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.gba_thread.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+        self.gba_running.store(false, Ordering::SeqCst);
     }
 
     fn search_and_fuse(&self, corrected: &KeyFrameAndPose, points: &[Arc<MapPoint>]) -> usize {
@@ -654,5 +698,47 @@ mod tests {
             target.get_id(),
             "merged target should become the active atlas map"
         );
+    }
+
+    #[test]
+    fn staged_global_ba_results_commit_atomically() {
+        let map = Arc::new(Map::new());
+        let keyframe = KeyFrame::from_frame(&build_frame(), map.clone());
+        map.add_key_frame(keyframe.clone());
+        let point = Arc::new(MapPoint::new());
+        map.add_map_point(point.clone());
+        let staged_pose = nalgebra::Isometry3::from_parts(
+            nalgebra::Translation3::new(1.0, 2.0, 3.0),
+            nalgebra::UnitQuaternion::identity(),
+        );
+        keyframe.set_tcw_gba(staged_pose, 9);
+        point.set_pos_gba(nalgebra::Vector3::new(4.0, 5.0, 6.0), 9);
+
+        assert_eq!(optimizer::commit_global_bundle_adjustment(&map, 9), 1);
+        assert!(
+            (keyframe.get_pose().translation.vector - staged_pose.translation.vector).norm() < 1e-6
+        );
+        assert!((point.get_world_pos() - nalgebra::Vector3::new(4.0, 5.0, 6.0)).norm() < 1e-6);
+    }
+
+    #[test]
+    fn background_global_ba_completes_and_shutdown_joins_it() {
+        let atlas = Arc::new(Atlas::from_kf_id(0));
+        let vocabulary = dummy_voc();
+        let database = Arc::new(KeyFrameDatabase::new(vocabulary.clone()));
+        let loop_closing = LoopClosing::new(atlas, database, vocabulary, true, true);
+        let map = Arc::new(Map::new());
+        let keyframe = KeyFrame::from_frame(&build_frame(), map.clone());
+        map.add_key_frame(keyframe);
+
+        loop_closing.start_global_bundle_adjustment(map, 1);
+        for _ in 0..1000 {
+            if !loop_closing.is_running_gba() {
+                break;
+            }
+            std::thread::sleep(Duration::from_micros(3000));
+        }
+        assert!(!loop_closing.is_running_gba());
+        loop_closing.request_finish();
     }
 }

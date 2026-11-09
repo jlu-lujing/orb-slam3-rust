@@ -45,7 +45,7 @@ smoke sequence.
 | Keyframe BoW recomputation | Implemented and tested |
 | Local mapping queue, BA, triangulation, fusion, culling, IMU init | Implemented |
 | Loop closing detection, three-frame confirmation, Sim3 correction | Implemented |
-| Loop search-and-fuse and global BA after correction | Implemented |
+| Loop search-and-fuse and dedicated background global BA | Implemented, staged commit test |
 | Atlas/map merge with optional inertial merge BA | Implemented |
 | Desktop GUI | `eframe` image/features, 3D map, graph, pause/step/reset/save |
 
@@ -73,17 +73,14 @@ match:
    consecutive current keyframes to select the same candidate. The full
    ORB-SLAM3 common-region search across the previous loop group, including
    candidate-side continuity and retry bookkeeping, is still simplified.
-3. **Global BA scheduling.** The port runs global BA synchronously after an
-   essential-graph correction while LocalMapping is stopped. ORB-SLAM3 runs a
-   dedicated global-BA thread and stages `mTcwGBA`/`mPosGBA` before committing.
-4. **Map merge completeness.** Merge now moves contents, adds the loop edge,
+3. **Map merge completeness.** Merge now moves contents, adds the loop edge,
    optionally runs inertial merge BA, and rebuilds connections. It does not yet
    reproduce every corrected-pose, duplicate-fusion, map-origin-id, and
    synchronization step of `MergeLocal`.
-5. **Accuracy parity.** No real EuRoC/TUM/KITTI trajectory was available in this
+4. **Accuracy parity.** No real EuRoC/TUM/KITTI trajectory was available in this
    workspace. The synthetic EuRoC smoke test validates execution and exports,
    not ATE/RPE parity.
-6. **C++ API/debug surface.** A few diagnostic methods such as timing injection
+5. **C++ API/debug surface.** A few diagnostic methods such as timing injection
    and legacy Atlas overloads are intentionally absent or represented by Rust
    APIs.
 
