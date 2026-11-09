@@ -300,13 +300,13 @@ impl LoopClosing {
         );
         source.apply_scaled_rotation(transform, sim3.scale() as f32, true);
         let (keyframes, points) = source.take_contents();
-        for keyframe in keyframes {
+        for keyframe in &keyframes {
             keyframe.update_map(target.clone());
-            target.add_key_frame(keyframe);
+            target.add_key_frame(keyframe.clone());
         }
-        for point in points {
+        for point in &points {
             point.update_map(target.clone());
-            target.add_map_point(point);
+            target.add_map_point(point.clone());
         }
         current.add_loop_edge(candidate);
         candidate.add_loop_edge(current);
@@ -321,6 +321,15 @@ impl LoopClosing {
                 .map(|keyframe| (keyframe.id, optimizer::sim3_from_pose(&keyframe.get_pose())))
                 .collect()
         };
+        let fixed_merge = Self::loop_neighborhood(candidate);
+        let fixed_current = Self::loop_neighborhood(current);
+        optimizer::optimize_essential_graph_merge(
+            current,
+            &fixed_merge,
+            &fixed_current,
+            &keyframes,
+            &points,
+        );
         let fuse_neighbors = Self::loop_neighborhood(candidate);
         let fuse_points = Self::loop_points(&fuse_neighbors);
         self.search_and_fuse(&corrected, &fuse_points);

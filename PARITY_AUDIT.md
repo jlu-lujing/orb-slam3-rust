@@ -74,9 +74,9 @@ match:
    neighborhood. The full ORB-SLAM3 retry bookkeeping and every common-region
    refinement branch are still simplified.
 3. **Map merge completeness.** Merge now moves contents, adds the loop edge,
-   optionally runs inertial merge BA, and rebuilds connections. It does not yet
-   reproduce every corrected local-window pose and spanning-tree rewiring step
-   of `MergeLocal`.
+   optionally runs inertial merge BA, invokes the merge essential-graph
+   optimizer, and rebuilds connections. Some relaunch-condition and
+   spanning-tree bookkeeping details of `MergeLocal` remain simplified.
 4. **Accuracy parity.** No real EuRoC/TUM/KITTI trajectory was available in this
    workspace. The synthetic EuRoC smoke test validates execution and exports,
    not ATE/RPE parity.
