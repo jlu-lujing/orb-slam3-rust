@@ -8,6 +8,7 @@ use crate::{
     local_mapping::LocalMapping,
     loop_closing::LoopClosing,
     map_point::MapPoint,
+    mlpnp::{MlpnpCorrespondence, solve_mlpnp_ransac},
     optimizer,
     orb_extractor::OrbExtractor,
     orb_matcher::OrbMatcher,
@@ -2156,7 +2157,7 @@ impl Tracking {
 
 fn pnp_relocalization_pose(frame: &Frame) -> Option<(Isometry3<f32>, Vec<usize>)> {
     let rig = frame.camera2.as_ref().zip(frame.n_left);
-    let mut groups: [Vec<(usize, PnpCorrespondence)>; 2] = [Vec::new(), Vec::new()];
+    let mut groups: [Vec<(usize, MlpnpCorrespondence)>; 2] = [Vec::new(), Vec::new()];
     for (idx, map_point) in frame.map_points.iter().enumerate() {
         let Some(map_point) = map_point else {
             continue;
@@ -2188,11 +2189,14 @@ fn pnp_relocalization_pose(frame: &Frame) -> Option<(Isometry3<f32>, Vec<usize>)
             continue;
         }
         let world = map_point.get_world_pos();
+        let max_error2 = frame.level_sigma2[keypoint.octave() as usize] as f64 * 5.991;
         groups[cam_idx].push((
             idx,
-            PnpCorrespondence {
-                world: opencv::core::Point3f::new(world.x, world.y, world.z),
-                bearing: opencv::core::Point2f::new(ray.x / ray.z, ray.y / ray.z),
+            MlpnpCorrespondence {
+                world: Vector3::new(world.x as f64, world.y as f64, world.z as f64),
+                bearing: Vector3::new(ray.x as f64, ray.y as f64, ray.z as f64).normalize(),
+                observed_px: keypoint.pt(),
+                max_error2,
             },
         ));
     }
@@ -2204,20 +2208,62 @@ fn pnp_relocalization_pose(frame: &Frame) -> Option<(Isometry3<f32>, Vec<usize>)
             .iter()
             .map(|(_, correspondence)| *correspondence)
             .collect();
-        let Some(solution) = solve_pnp_ransac(&correspondences) else {
-            continue;
+        let camera = if cam_idx == 1 {
+            frame.camera2.as_ref().expect("right camera").as_ref()
+        } else {
+            frame.camera.as_ref()
+        };
+        let (tcw64, pnp_inliers) = if let Some(solution) =
+            solve_mlpnp_ransac(camera, &correspondences)
+        {
+            (solution.tcw, solution.inliers)
+        } else {
+            let fallback: Vec<_> = correspondences
+                .iter()
+                .enumerate()
+                .filter_map(|(index, correspondence)| {
+                    (correspondence.bearing.z.abs() > 1e-8).then_some((
+                        index,
+                        PnpCorrespondence {
+                            world: opencv::core::Point3f::new(
+                                correspondence.world.x as f32,
+                                correspondence.world.y as f32,
+                                correspondence.world.z as f32,
+                            ),
+                            bearing: opencv::core::Point2f::new(
+                                (correspondence.bearing.x / correspondence.bearing.z) as f32,
+                                (correspondence.bearing.y / correspondence.bearing.z) as f32,
+                            ),
+                        },
+                    ))
+                })
+                .collect();
+            let inputs: Vec<_> = fallback
+                .iter()
+                .map(|(_, correspondence)| *correspondence)
+                .collect();
+            let Some(solution) = solve_pnp_ransac(&inputs) else {
+                continue;
+            };
+            (
+                crate::converter::isometry3_f32_to_f64(&solution.tcw),
+                solution
+                    .inliers
+                    .into_iter()
+                    .filter_map(|index| fallback.get(index).map(|(group_index, _)| *group_index))
+                    .collect(),
+            )
         };
         let tcw = if cam_idx == 1 {
-            frame.get_relative_pose_trl().inverse() * solution.tcw
+            frame.get_relative_pose_trl().inverse().cast::<f64>() * tcw64
         } else {
-            solution.tcw
+            tcw64
         };
-        let indices = solution
-            .inliers
+        let indices = pnp_inliers
             .into_iter()
             .filter_map(|pnp_idx| group.get(pnp_idx).map(|(idx, _)| *idx))
             .collect();
-        return Some((tcw, indices));
+        return Some((tcw.cast::<f32>(), indices));
     }
     None
 }

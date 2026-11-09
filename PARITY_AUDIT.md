@@ -38,7 +38,7 @@ smoke sequence.
 | IMU noise scaling, preintegration boundary interpolation | Aligned, focused tests |
 | Monocular/stereo/RGB-D image preprocessing | Resize/remap wired, tests |
 | Right fisheye-rig observations in inertial pose optimization | Wired, tests |
-| Relocalization pose initialization | Bearing-based PnP-RANSAC path, pose-recovery test |
+| Relocalization pose initialization | MLPnP nullspace+RANSAC+GN, planar/non-planar and outlier tests |
 | TUM/EuRoC/KITTI trajectory semantics | Sensor/body/frame normalization aligned, tests |
 | Active-map reset | Thread synchronization, DB cleanup, map detachment, tests |
 | Bad-keyframe removal from BoW database | Implemented and tested |
@@ -65,11 +65,10 @@ smoke sequence.
 These are the material areas where behavior is not yet an exact algorithm-level
 match:
 
-1. **Relocalization PnP implementation.** ORB-SLAM3 uses MLPnP directly on
-   bearing vectors with covariance support. This port currently converts
-   bearings to normalized image coordinates and runs OpenCV EPnP-RANSAC. This
-   covers pinhole and fisheye front-facing observations, but is not a line-level
-   MLPnP port and does not yet model per-bearing covariance.
+1. **MLPnP Jacobian implementation.** The MLPnP linear estimator, RANSAC and
+   bearing-residual refinement are ported. The original's large hand-derived
+   Jacobian is replaced by finite differences; OpenCV EPnP remains only as a
+   fallback when the MLPnP estimate has no valid solution.
 2. **Loop candidate continuity.** A loop now requires three distinct,
    consecutive current keyframes to select the same candidate. The full
    ORB-SLAM3 common-region search across the previous loop group, including

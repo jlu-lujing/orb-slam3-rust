@@ -25,6 +25,7 @@ pub mod local_mapping;
 pub mod loop_closing;
 pub mod map;
 pub mod map_point;
+pub mod mlpnp;
 pub mod optimizable_types;
 pub mod optimizer;
 pub mod orb_extractor;
