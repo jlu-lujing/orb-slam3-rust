@@ -809,50 +809,58 @@ impl std::fmt::Display for Settings {
 
 fn read_param_string(storage: &FileStorage, node: &str) -> Option<String> {
     let node = storage.get(node);
-    if let Ok(node) = node {
-        if node.is_string().expect("expected string") {
-            return Some(node.to_string().expect("expected string"));
-        }
+    if let Ok(node) = node
+        && !node.is_none().unwrap_or(true)
+        && node.is_string().expect("expected string")
+    {
+        return Some(node.to_string().expect("expected string"));
     }
     None
 }
 
 fn read_param_float(storage: &FileStorage, node: &str) -> Option<f32> {
     let node = storage.get(node);
-    if let Ok(node) = node {
-        if node.is_real().expect("expected float") {
-            return Some(node.to_f32().expect("expected float"));
-        }
+    if let Ok(node) = node
+        && !node.is_none().unwrap_or(true)
+        && node.is_real().expect("expected float")
+    {
+        return Some(node.to_f32().expect("expected float"));
     }
     None
 }
 
 fn read_param_int(storage: &FileStorage, node: &str) -> Option<i64> {
     let node = storage.get(node);
-    if let Ok(node) = node {
-        if node.is_int().expect("expected float") {
-            return Some(node.to_i64().expect("expected int"));
-        }
+    if let Ok(node) = node
+        && !node.is_none().unwrap_or(true)
+        && node.is_int().expect("expected int")
+    {
+        // OpenCV YAML stores scalar integers as `int`; `to_i64()` is for
+        // nodes already classified as `int64` and returns the overflow
+        // sentinel for ordinary settings values.
+        return Some(node.to_i32().expect("expected int") as i64);
     }
     None
 }
 
 fn read_param_bool(storage: &FileStorage, node: &str) -> Option<bool> {
     let node = storage.get(node);
-    if let Ok(node) = node {
-        if node.is_int().expect("expected bool") {
-            return Some(node.to_i32().expect("expected bool") == 1);
-        }
+    if let Ok(node) = node
+        && !node.is_none().unwrap_or(true)
+        && node.is_int().expect("expected bool")
+    {
+        return Some(node.to_i32().expect("expected bool") == 1);
     }
     None
 }
 
 fn read_param_mat(storage: &FileStorage, node: &str) -> Option<Mat> {
     let node = storage.get(node);
-    if let Ok(node) = node {
-        if let Ok(mat) = node.mat() {
-            return Some(mat);
-        }
+    if let Ok(node) = node
+        && !node.is_none().unwrap_or(true)
+        && let Ok(mat) = node.mat()
+    {
+        return Some(mat);
     }
     None
 }

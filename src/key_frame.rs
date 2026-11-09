@@ -508,6 +508,83 @@ impl KeyFrame {
         self.update_best_covisibles();
     }
 
+    /// Rebuild this keyframe's covisibility graph from the points it observes.
+    ///
+    /// Mirrors `KeyFrame::UpdateConnections`: every non-bad keyframe in the same
+    /// map sharing a MapPoint contributes one vote. The first non-root
+    /// keyframe also selects its strongest neighbour as its spanning-tree
+    /// parent. Connections are reciprocal, as in the C++ implementation.
+    pub fn update_connections(self: &Arc<Self>) {
+        let map_id = self.get_map().map(|map| map.get_id());
+        let mut counts: HashMap<u64, (Arc<KeyFrame>, i32)> = HashMap::new();
+
+        for mp in self.get_map_point_matches().into_iter().flatten() {
+            if mp.is_bad() {
+                continue;
+            }
+            for (other, _) in mp.get_observations() {
+                if other.id == self.id
+                    || other.is_bad()
+                    || other.get_map().map(|map| map.get_id()) != map_id
+                {
+                    continue;
+                }
+                counts
+                    .entry(other.id)
+                    .and_modify(|(_, count)| *count += 1)
+                    .or_insert((other, 1));
+            }
+        }
+
+        if counts.is_empty() {
+            return;
+        }
+
+        // Matches upstream: add a bidirectional edge for every sufficiently
+        // strong neighbour, or fall back to the strongest one if none reaches
+        // the threshold.
+        let max = counts
+            .values()
+            .max_by_key(|(_, count)| *count)
+            .map(|(kf, count)| (kf.clone(), *count))
+            .expect("counts is non-empty");
+        let mut connected = false;
+        for (other, count) in counts.values() {
+            if *count >= 15 {
+                other.add_connection(self, *count);
+                connected = true;
+            }
+        }
+
+        if !connected {
+            max.0.add_connection(self, max.1);
+        }
+
+        let init_kf_id = self.get_map().map(|map| map.get_init_kf_id());
+        {
+            let mut conn = self.conn.write().unwrap();
+            conn.connected_weights = counts
+                .into_iter()
+                .map(|(id, (kf, count))| (id, (Arc::downgrade(&kf), count)))
+                .collect();
+        }
+        self.update_best_covisibles();
+
+        if init_kf_id != Some(self.id) {
+            let should_link_parent = {
+                let mut conn = self.conn.write().unwrap();
+                let first = conn.first_connection;
+                if first {
+                    conn.first_connection = false;
+                }
+                first
+            };
+            if should_link_parent {
+                self.change_parent(&max.0);
+            }
+        }
+    }
+
     pub fn erase_connection(&self, kf: &KeyFrame) {
         let updated = {
             let mut conn = self.conn.write().unwrap();
@@ -1347,6 +1424,29 @@ mod tests {
         let u = kf.project_point_undistort(&mp).expect("undistort");
         assert!(approx(u.x, 390.147705, 1e-2), "u={}", u.x);
         assert!(approx(u.y, 255.996597, 1e-2), "v={}", u.y);
+    }
+
+    #[test]
+    fn update_connections_builds_reciprocal_covisibility_and_parent() {
+        let map = Arc::new(Map::new());
+        let a = KeyFrame::from_frame(&build_frame(), map.clone());
+        let b = KeyFrame::from_frame(&build_frame(), map.clone());
+        assert!(a.id != 0);
+
+        for i in 0..16 {
+            let pos = Vector3::new(i as f32, 0.0, 5.0);
+            let mp = MapPoint::from_pos_ref(&pos, a.clone(), a.get_map().unwrap());
+            mp.add_observation(&a, i);
+            mp.add_observation(&b, i);
+            a.add_map_point(mp, i as usize);
+        }
+
+        a.update_connections();
+
+        assert_eq!(a.get_weight(&b), 16);
+        assert_eq!(b.get_weight(&a), 16);
+        assert_eq!(a.get_parent().expect("parent").id, b.id);
+        assert!(b.has_child(&a));
     }
 
     #[test]

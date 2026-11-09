@@ -17,7 +17,6 @@ use crate::{
     settings::{Settings, SettingsError},
     viewer::Viewer,
 };
-use crate::{key_frame_database, orb_vocabulary};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sensor {
@@ -73,13 +72,13 @@ impl System {
 
         // Load settings
         let settings =
-            Settings::new(settings_path, sensor).map_err(|e| SystemError::InvalidSettings(e))?;
-        let loop_closing = settings.loop_closing;
+            Settings::new(settings_path, sensor).map_err(SystemError::InvalidSettings)?;
+        let _loop_closing = settings.loop_closing;
 
         // Load ORB VOB vocabulary
         info!("Loading ORB vocabulary. This could take a while...");
         let vocabulary = OrbVocabulary::load_from_text_file(vocabulary_path)
-            .map_err(|e| SystemError::InvalidORBVocabulary(e))?;
+            .map_err(SystemError::InvalidORBVocabulary)?;
         info!("ORB vocabulary loaded!");
         let vocabulary = Arc::new(vocabulary);
         // Create keyframe database
@@ -134,6 +133,25 @@ impl System {
             load_atlas_file_path: settings.load_and_save.load_from.clone(),
             save_atlas_file_path: settings.load_and_save.save_to.clone(),
         })
+    }
+
+    /// Minimal system handle for unit tests that exercise another component's
+    /// wiring without loading the ORB vocabulary or settings files.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(sensor: Sensor) -> Self {
+        System {
+            sensor,
+            #[cfg(feature = "viewer")]
+            viewer: None,
+            reset: false,
+            reset_active_map: false,
+            activate_localization_mode: false,
+            deactivate_localization_mode: false,
+            shutdown: false,
+            vocabulary_file_path: PathBuf::new(),
+            load_atlas_file_path: None,
+            save_atlas_file_path: None,
+        }
     }
 }
 

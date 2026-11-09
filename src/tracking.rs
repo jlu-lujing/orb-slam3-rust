@@ -17,10 +17,10 @@ use nalgebra::{Isometry3, Matrix3};
 use opencv::imgproc::cvt_color;
 use opencv::prelude::*;
 use opencv::{
-    core::{ALGO_HINT_DEFAULT, CV_32F, Mat, MatExprTraitConst, Point2f, Point3f, Scalar},
+    core::{CV_32F, Mat, MatExprTraitConst, Point2f, Point3f, Scalar},
     imgproc::ColorConversionCodes,
 };
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 use tracing::{info, warn};
 
 pub struct Tracking {
@@ -619,10 +619,10 @@ impl Tracking {
     fn track(&mut self) {
         #[cfg(feature = "viewer")]
         if self.step_by_step {
-            info!("Tracking: Waiting to the next step");
-            while !self.step && self.step_by_step {
-                std::thread::sleep(Duration::from_micros(500));
-            }
+            // Step control still needs an external, thread-safe command channel.
+            // Polling a plain bool here would never observe a producer update.
+            warn!("Step-by-step viewer control is not wired yet; continuing");
+            self.step_by_step = false;
             self.step = false;
         }
 

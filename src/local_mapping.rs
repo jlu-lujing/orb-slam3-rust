@@ -263,7 +263,7 @@ impl LocalMapping {
 
     // Main function
     pub fn run(&self) {
-        self.finish.lock().unwrap().finished = true;
+        self.finish.lock().unwrap().finished = false;
 
         loop {
             // tracking will see that local mapping is busy
@@ -285,7 +285,7 @@ impl LocalMapping {
                     // Triangulate new MapPoints
                     self.create_new_map_points();
 
-                    self.abort_ba.store(true, Ordering::SeqCst);
+                    self.abort_ba.store(false, Ordering::SeqCst);
 
                     if !self.check_new_key_frames() {
                         // Find more matches in neighbor keyframes and fuse point duplications
@@ -295,7 +295,7 @@ impl LocalMapping {
 
                 if !self.check_new_key_frames()
                     && !self.stop_requested()
-                    && let Some(current_keyframe) = self.current_key_frame.lock().unwrap().as_ref()
+                    && let Some(current_keyframe) = self.get_curr_kf()
                 {
                     if let Some(key_frames) = self.atlas.key_frames_in_map()
                         && key_frames > 2
@@ -335,7 +335,7 @@ impl LocalMapping {
                                 let large = ((inliers > 75) && self.monocular)
                                     || ((inliers > 100) && !self.monocular);
                                 Some(optimizer::local_inertial_ba(
-                                    current_keyframe,
+                                    &current_keyframe,
                                     Some(self.abort_ba.clone()),
                                     &map,
                                     large,
@@ -346,7 +346,7 @@ impl LocalMapping {
                             }
                         } else if let Some(map) = current_keyframe.get_map() {
                             Some(optimizer::local_bundle_adjustment(
-                                current_keyframe,
+                                &current_keyframe,
                                 Some(self.abort_ba.clone()),
                                 &map,
                             ))
@@ -369,54 +369,39 @@ impl LocalMapping {
                         }
                     }
 
-                    // Initialize the IMU here
                     if let Some(map) = current_keyframe.get_map()
                         && !map.is_imu_initialized()
                         && self.inertial
                     {
-                        if self.monocular {
-                            // TODO
-                        } else {
-                            // TODO
-                        }
+                        let prior_a = if self.monocular { 1e10 } else { 1e5 };
+                        self.initialize_imu(1e2, prior_a, true);
                     }
 
-                    // TODO
+                    // Redundant-keyframe culling is a separate mapping stage.
+                    self.key_frame_culling();
                 }
-                // TODO
+
+                // The loop-closing queue is wired in once LoopClosing is ported.
+            } else if self.stop() && !self.bad_imu.load(Ordering::SeqCst) {
+                while self.is_stopped() && !self.check_finish() {
+                    std::thread::sleep(Duration::from_micros(3000));
+                }
+                if self.check_finish() {
+                    break;
+                }
             }
-        }
-    }
 
-    fn initialize_imu(&mut self, prior_g: f32, prior_a: f32, fiba: bool) {
-        if self.reset.lock().unwrap().reset_requested {
-            return;
-        }
+            self.reset_if_requested();
+            self.set_accept_key_frames(true);
 
-        let (min_time, min_kf): (f32, usize) = if self.monocular { (2.0, 10) } else { (1.0, 10) };
+            if self.check_finish() {
+                break;
+            }
 
-        if let Some(keyframes) = self.atlas.key_frames_in_map()
-            && keyframes < min_kf
-        {
-            return;
+            std::thread::sleep(Duration::from_micros(3000));
         }
 
-        // Retrieve all keyframe in temporal order
-        let mut kfs: Vec<Arc<KeyFrame>> = Vec::new();
-        let mut current = self.current_key_frame.lock().unwrap().clone();
-        while let Some(kf) = current {
-            kfs.push(kf.clone());
-            current = kf.get_prev_kf().clone();
-        }
-        kfs.reverse();
-
-        if kfs.len() < min_kf {
-            return;
-        }
-
-        let first_ts = kfs[0].timestamp;
-
-        // TODO
+        self.set_finished();
     }
 
     /// Enqueue a keyframe and request BA abort (upstream `InsertKeyFrame`).
@@ -428,7 +413,9 @@ impl LocalMapping {
     }
 
     pub fn empty_queue(&self) {
-        // TODO: drain and process the queue (upstream `EmptyQueue`).
+        while self.check_new_key_frames() {
+            self.process_new_key_frame();
+        }
     }
 
     // --- Thread sync -------------------------------------------------------
@@ -558,13 +545,67 @@ impl LocalMapping {
     }
     fn process_new_key_frame(&self) {
         let next = self.new_key_frames.lock().unwrap().pop_front();
-        if let Some(kf) = next {
-            *self.current_key_frame.lock().unwrap() = Some(kf);
-            // TODO: BoW, observations, connections, map insertion.
+        let Some(kf) = next else {
+            return;
+        };
+        *self.current_key_frame.lock().unwrap() = Some(kf.clone());
+
+        // BoW is already computed when a Frame is promoted to KeyFrame. The
+        // descriptors and vocabulary are immutable from that point onward.
+        let mut recent = Vec::new();
+        for (idx, mp) in kf.get_map_point_matches().into_iter().enumerate() {
+            let Some(mp) = mp else {
+                continue;
+            };
+            if mp.is_bad() {
+                continue;
+            }
+
+            if mp.is_in_keyframe(&kf) {
+                recent.push(mp);
+            } else {
+                mp.add_observation(&kf, idx as i32);
+                mp.update_normal_and_depth();
+                mp.compute_distinctive_descriptors();
+            }
         }
+
+        if !recent.is_empty() {
+            self.recent_added_map_points.lock().unwrap().extend(recent);
+        }
+
+        kf.update_connections();
+        self.atlas.add_key_frame(kf);
     }
     fn create_new_map_points(&self) {}
-    fn map_point_culling(&self) {}
+    fn map_point_culling(&self) {
+        let current_kf_id = match self.get_curr_kf() {
+            Some(kf) => kf.id,
+            None => return,
+        };
+        let min_observations = if self.monocular { 2 } else { 3 };
+        let pending = std::mem::take(&mut *self.recent_added_map_points.lock().unwrap());
+        let mut retained = Vec::with_capacity(pending.len());
+
+        for mp in pending {
+            if mp.is_bad() || mp.get_found_ratio() < 0.25 {
+                mp.set_bad_flag();
+                continue;
+            }
+
+            // Tracking-created points carry upstream's sentinel `mnFirstKFid=-1`
+            // (`None` here) until they have been observed for several frames.
+            let first_kf_id = mp.first_kf_id.map(i128::from).unwrap_or(-1);
+            let age = current_kf_id as i128 - first_kf_id;
+            if age >= 2 && mp.observations() <= min_observations {
+                mp.set_bad_flag();
+            } else if age < 3 {
+                retained.push(mp);
+            }
+        }
+
+        *self.recent_added_map_points.lock().unwrap() = retained;
+    }
     fn search_in_neighbors(&self) {}
     fn key_frame_culling(&self) {}
 
@@ -614,4 +655,80 @@ impl LocalMapping {
     ) {
     }
     fn scale_refinement(&self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::build_frame;
+
+    fn make_mapping(atlas: Arc<Atlas>) -> LocalMapping {
+        LocalMapping::new(
+            Arc::new(System::new_for_test(crate::system::Sensor::Stereo)),
+            atlas,
+            true,
+            false,
+            "test".to_owned(),
+        )
+    }
+
+    #[test]
+    fn empty_queue_registers_keyframes_observations_and_connections() {
+        let atlas = Arc::new(Atlas::from_kf_id(0));
+        let map = atlas.get_current_map();
+        let frame = build_frame();
+        let a = KeyFrame::from_frame(&frame, map.clone());
+        let b = KeyFrame::from_frame(&frame, map.clone());
+
+        for i in 0..16 {
+            let pos = Vector3::new(i as f32, 0.0, 5.0);
+            let mp = MapPoint::from_pos_ref(&pos, a.clone(), map.clone());
+            mp.add_observation(&a, i);
+            mp.add_observation(&b, i);
+            a.add_map_point(mp.clone(), i as usize);
+            b.add_map_point(mp.clone(), i as usize);
+            map.add_map_point(mp);
+        }
+
+        let mapping = make_mapping(atlas.clone());
+        mapping.insert_key_frame(a.clone());
+        mapping.insert_key_frame(b.clone());
+        mapping.empty_queue();
+
+        assert_eq!(mapping.keyframes_in_queue(), 0);
+        assert_eq!(mapping.get_curr_kf().expect("current keyframe").id, b.id);
+        assert_eq!(atlas.key_frames_in_map(), Some(2));
+        assert_eq!(a.get_weight(&b), 16);
+        assert_eq!(b.get_weight(&a), 16);
+        for i in 0..16 {
+            let mp = a.get_map_point(i).expect("map point match");
+            assert!(mp.is_in_keyframe(&a));
+            assert!(mp.is_in_keyframe(&b));
+        }
+    }
+
+    #[test]
+    fn map_point_culling_removes_poor_early_points() {
+        let atlas = Arc::new(Atlas::from_kf_id(0));
+        let map = atlas.get_current_map();
+        let kf = KeyFrame::from_frame(&build_frame(), map.clone());
+        let mapping = make_mapping(atlas);
+        mapping.insert_key_frame(kf.clone());
+        mapping.empty_queue();
+
+        let mp = MapPoint::from_pos_ref(&Vector3::new(0.0, 0.0, 5.0), kf.clone(), map);
+        mp.add_observation(&kf, 0);
+        mp.increase_visible(4);
+        assert!(mp.get_found_ratio() < 0.25);
+        mapping
+            .recent_added_map_points
+            .lock()
+            .unwrap()
+            .push(mp.clone());
+
+        mapping.map_point_culling();
+
+        assert!(mp.is_bad());
+        assert!(mapping.recent_added_map_points.lock().unwrap().is_empty());
+    }
 }
