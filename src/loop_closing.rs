@@ -618,4 +618,40 @@ mod tests {
         loop_closing.request_reset_active_map(map);
         assert_eq!(loop_closing.keyframes_in_queue(), 0);
     }
+
+    #[test]
+    fn merge_maps_moves_source_contents_into_target() {
+        let atlas = Arc::new(Atlas::from_kf_id(0));
+        let vocabulary = dummy_voc();
+        let database = Arc::new(KeyFrameDatabase::new(vocabulary.clone()));
+        let loop_closing = LoopClosing::new(atlas.clone(), database, vocabulary, true, true);
+        let source = Arc::new(Map::new());
+        let target = Arc::new(Map::new());
+        let current = KeyFrame::from_frame(&build_frame(), source.clone());
+        let candidate = KeyFrame::from_frame(&build_frame(), target.clone());
+        source.add_key_frame(current.clone());
+        target.add_key_frame(candidate.clone());
+
+        loop_closing.merge_maps(
+            &current,
+            &candidate,
+            Sim3::new(
+                nalgebra::UnitQuaternion::identity(),
+                nalgebra::Vector3::zeros(),
+                1.0,
+            ),
+        );
+
+        assert_eq!(source.key_frames_in_map(), 0);
+        assert_eq!(target.key_frames_in_map(), 2);
+        assert_eq!(
+            current.get_map().map(|map| map.get_id()),
+            Some(target.get_id())
+        );
+        assert_eq!(
+            atlas.get_current_map().get_id(),
+            target.get_id(),
+            "merged target should become the active atlas map"
+        );
+    }
 }

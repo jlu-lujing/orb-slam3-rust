@@ -2377,4 +2377,57 @@ mod tests {
 
         assert_eq!(lost, [true, false]);
     }
+
+    #[test]
+    fn relocalization_pnp_uses_rig_right_camera_observations() {
+        let map = Arc::new(crate::map::Map::new());
+        let mut frame = build_frame();
+        let expected = make_pose();
+        let camera2: Arc<dyn crate::camera_models::GeometricCamera> =
+            Arc::new(crate::camera_models::pinhole::Pinhole::with_params(vec![
+                458.654, 457.296, 367.215, 248.375,
+            ]));
+        frame.camera2 = Some(camera2.clone());
+        frame.n_left = Some(0);
+        frame.n_right = Some(8);
+        frame.keys = Vec::new();
+        frame.keys_un = None;
+        let world_points = [
+            Point3::new(-1.0, -0.5, 4.0),
+            Point3::new(1.0, -0.5, 4.0),
+            Point3::new(1.0, 0.5, 4.0),
+            Point3::new(-1.0, 0.5, 4.0),
+            Point3::new(-0.8, -0.4, 5.0),
+            Point3::new(0.8, -0.4, 5.0),
+            Point3::new(0.8, 0.4, 5.0),
+            Point3::new(-0.8, 0.4, 5.0),
+        ];
+        let mut keys_right = Vec::new();
+        for &world in &world_points {
+            let camera_point = expected * Point3::new(world.x, world.y, world.z);
+            let uv = camera2.project_n_d(&camera_point.cast::<f64>());
+            keys_right.push(keypoint(uv.x as f32, uv.y as f32));
+        }
+        frame.keys_right = Some(keys_right);
+        let mut map_points = Vec::new();
+        for world in world_points {
+            let point = MapPoint::from_frame(
+                &Vector3::new(world.x, world.y, world.z),
+                map.clone(),
+                &frame,
+                0,
+            );
+            point.set_world_pos(Vector3::new(world.x, world.y, world.z));
+            map_points.push(Some(point));
+        }
+        frame.n = 8;
+        frame.u_right = vec![-1.0; 8];
+        frame.map_points = map_points;
+
+        let (solved, inliers) = pnp_relocalization_pose(&frame).expect("right-camera PnP pose");
+        let delta = solved.inverse() * expected;
+        assert!(delta.rotation.angle().abs() < 1e-3);
+        assert!(delta.translation.vector.norm() < 1e-3);
+        assert_eq!(inliers.len(), frame.n);
+    }
 }

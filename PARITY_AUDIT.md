@@ -100,6 +100,6 @@ LIBCLANG_PATH=/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault
 cargo clippy --all-targets --features gui -- -D warnings
 ```
 
-The source-size counts are 29,902 C++ implementation lines versus 32,757 Rust
+The source-size counts are 29,902 C++ implementation lines versus 33,085 Rust
 lines including inline tests and documentation. These counts are useful for
 scope estimation only and are not a completion or equivalence metric.
