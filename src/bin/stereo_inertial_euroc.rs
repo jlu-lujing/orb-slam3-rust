@@ -43,6 +43,7 @@ enum RuntimeError {
     IMULoadFailed(io::Error),
     ImageDecode(PathBuf),
     SystemInit(SystemError),
+    SaveFailed(io::Error),
 }
 
 impl From<SystemError> for RuntimeError {
@@ -310,6 +311,10 @@ fn main() -> Result<(), RuntimeError> {
         }
     }
 
+    slam.save_trajectory_euroc("CameraTrajectory.txt")
+        .map_err(RuntimeError::SaveFailed)?;
+    slam.save_keyframe_trajectory_euroc("KeyFrameTrajectory.txt")
+        .map_err(RuntimeError::SaveFailed)?;
     slam.shutdown();
     if !times_track.is_empty() {
         info!(

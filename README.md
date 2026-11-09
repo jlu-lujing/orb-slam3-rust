@@ -50,16 +50,50 @@ If you use ORB-SLAM3 in an academic work, please cite:
 
 # 2. Prerequisites
 
-Currently only tested on Linux. You just need a recent Rust compiler and OpenCV 4.x.
+You need a recent Rust compiler, OpenCV 4.x, and Clang/`libclang`. The desktop
+viewer supports macOS and Linux through `eframe` + `wgpu`.
 
 # 3. Building ORB-SLAM3-RS library and examples
 
-Clone this repository:
-https://github.com/nondescriptpointer/orb-slam3-rs
-
-Build:
+```bash
+git clone --recurse-submodules git@github.com:jlu-lujing/orb-slam3-rust.git
+cd orb-slam3-rust
 cargo build
+```
 
 # 4. Running ORB-SLAM3-RS with your camera
 
-TBD
+Command-line EuRoC stereo-inertial runner:
+
+```bash
+cargo run --bin stereo_inertial_euroc -- \
+  vocabulary/orbvoc.txt \
+  config/euroc.yaml \
+  recording/euroc/MH_01_easy \
+  recording/euroc/MH_01_easy/times.txt
+```
+
+The runner writes `CameraTrajectory.txt` and `KeyFrameTrajectory.txt`.
+
+Desktop viewer:
+
+```bash
+cargo run --features gui --bin slam_viewer -- \
+  vocabulary/orbvoc.txt \
+  config/euroc.yaml \
+  recording/euroc/MH_01_easy \
+  recording/euroc/MH_01_easy/times.txt \
+  --realtime
+```
+
+The viewer runs SLAM on a worker thread and displays the current image and ORB
+features, map points, keyframes, covisibility graph, and current camera pose.
+It supports localization mode, reset, orbit/zoom navigation, track following,
+and trajectory/Atlas export.
+
+The original C++ implementation is available at `3rdparty/ORB_SLAM3` as a Git
+submodule:
+
+```bash
+git submodule update --init --recursive
+```

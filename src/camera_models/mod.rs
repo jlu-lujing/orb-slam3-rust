@@ -28,7 +28,7 @@ pub(crate) fn peek_next_camera_id() -> u64 {
 }
 /// Restore the global camera-id counter (after deserialization).
 pub(crate) fn set_next_camera_id(v: u64) {
-    NEXT_GEOMETRIC_CAMERA_ID.store(v, Ordering::Relaxed);
+    NEXT_GEOMETRIC_CAMERA_ID.fetch_max(v, Ordering::Relaxed);
 }
 
 // `Send + Sync` supertrait: cameras are shared across the Tracking /
@@ -59,7 +59,7 @@ pub trait GeometricCamera: Send + Sync {
     fn project_jac(&self, p3d: &Point3<f64>) -> Matrix2x3<f64>;
 
     fn reconstruct_with_two_views(
-        &mut self,
+        &self,
         keys1: &Vec<KeyPoint>,
         keys2: &Vec<KeyPoint>,
         matches: &Vec<Option<usize>>,

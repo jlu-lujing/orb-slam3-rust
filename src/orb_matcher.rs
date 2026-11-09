@@ -1240,7 +1240,7 @@ impl OrbMatcher {
     }
 
     // Matching for the Map Initialization (only used in the monocular case)
-    fn search_for_initialization(
+    pub(crate) fn search_for_initialization(
         &self,
         f1: &Frame,
         f2: &Frame,

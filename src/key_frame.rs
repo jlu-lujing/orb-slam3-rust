@@ -48,7 +48,7 @@ pub(crate) fn peek_next_id() -> u64 {
 }
 /// Restore the global keyframe-id counter (after deserialization).
 pub(crate) fn set_next_id(v: u64) {
-    NEXT_ID.store(v, Ordering::SeqCst);
+    NEXT_ID.fetch_max(v, Ordering::SeqCst);
 }
 
 /// Pose-group state
@@ -149,7 +149,7 @@ pub struct KeyFrame {
     pub right_to_left_match: Option<Vec<usize>>,
 
     pub imu_calib: Arc<Calib>,
-    pub imu_preintegrated: Option<Arc<Preintegrated>>,
+    imu_preintegrated: RwLock<Option<Arc<Preintegrated>>>,
 
     pub origin_map_id: u32,
     pub name_file: String,
@@ -260,7 +260,7 @@ impl KeyFrame {
             left_to_right_match: frame.left_to_right_match.clone(),
             right_to_left_match: frame.right_to_left_match.clone(),
             imu_calib: frame.imu_calib.clone(),
-            imu_preintegrated: frame.imu_preintegrated.clone(),
+            imu_preintegrated: RwLock::new(frame.imu_preintegrated.clone()),
             origin_map_id: map.get_id(),
             name_file: frame.name_file.clone(),
             dataset: frame.dataset as u32,
@@ -304,6 +304,14 @@ impl KeyFrame {
 
     pub fn set_inertial(&self) {
         self.imu.store(true, Ordering::SeqCst);
+    }
+
+    pub fn get_imu_preintegrated(&self) -> Option<Arc<Preintegrated>> {
+        self.imu_preintegrated.read().unwrap().clone()
+    }
+
+    pub fn set_imu_preintegrated(&self, value: Option<Arc<Preintegrated>>) {
+        *self.imu_preintegrated.write().unwrap() = value;
     }
 
     /// Recompute the BoW representation from the descriptors.
@@ -860,11 +868,17 @@ impl KeyFrame {
     pub fn set_prev_kf(&self, kf: &Arc<KeyFrame>) {
         *self.prev_kf.write().unwrap() = Arc::downgrade(kf);
     }
+    pub fn clear_prev_kf(&self) {
+        *self.prev_kf.write().unwrap() = Weak::new();
+    }
     pub fn get_prev_kf(&self) -> Option<Arc<KeyFrame>> {
         self.prev_kf.read().unwrap().upgrade()
     }
     pub fn set_next_kf(&self, kf: &Arc<KeyFrame>) {
         *self.next_kf.write().unwrap() = Arc::downgrade(kf);
+    }
+    pub fn clear_next_kf(&self) {
+        *self.next_kf.write().unwrap() = Weak::new();
     }
     pub fn get_next_kf(&self) -> Option<Arc<KeyFrame>> {
         self.next_kf.read().unwrap().upgrade()
@@ -1176,7 +1190,7 @@ impl KeyFrame {
             left_to_right_match: self.left_to_right_match.clone(),
             right_to_left_match: self.right_to_left_match.clone(),
             imu_calib: (*self.imu_calib).clone(),
-            imu_preintegrated: self.imu_preintegrated.as_deref().cloned(),
+            imu_preintegrated: self.imu_preintegrated.read().unwrap().as_deref().cloned(),
             origin_map_id: self.origin_map_id,
             name_file: self.name_file.clone(),
             dataset: self.dataset,
@@ -1264,7 +1278,7 @@ impl KeyFrame {
             left_to_right_match: b.left_to_right_match.clone(),
             right_to_left_match: b.right_to_left_match.clone(),
             imu_calib: Arc::new(b.imu_calib.clone()),
-            imu_preintegrated: b.imu_preintegrated.clone().map(Arc::new),
+            imu_preintegrated: RwLock::new(b.imu_preintegrated.clone().map(Arc::new)),
             origin_map_id: b.origin_map_id,
             name_file: b.name_file.clone(),
             dataset: b.dataset,

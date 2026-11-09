@@ -2,6 +2,7 @@ pub mod atlas;
 pub mod camera_models;
 pub mod compat;
 pub mod converter;
+pub mod euroc;
 pub mod frame;
 pub mod g2o_core;
 pub mod g2o_types;

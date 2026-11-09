@@ -41,6 +41,21 @@ unsafe impl Sync for SendKeyPoints<'_> {}
 pub struct ReconstructResult {
     t21: Isometry3<f32>,
     triangulated: Vec<bool>,
+    p3d: Vec<Point3f>,
+}
+
+impl ReconstructResult {
+    pub fn t21(&self) -> Isometry3<f32> {
+        self.t21
+    }
+
+    pub fn triangulated(&self) -> &[bool] {
+        &self.triangulated
+    }
+
+    pub fn points_3d(&self) -> &[Point3f] {
+        &self.p3d
+    }
 }
 
 impl TwoViewReconstruction {
@@ -232,6 +247,7 @@ impl TwoViewReconstruction {
         let mut best_solution_idx = 0;
         let mut best_parallax = -1.0f32;
         let mut best_triangulated = Vec::<bool>::new();
+        let mut best_p3d = Vec::<Point3f>::new();
 
         // Instead of applying the visibility constraints proposed in the Faugeras paper (which could fail for points seen with low parallax)
         // We reconstruct all hypotheses and check in terms of triangulated points and parallax
@@ -252,6 +268,7 @@ impl TwoViewReconstruction {
                 best_solution_idx = i;
                 best_parallax = result.parallax;
                 best_triangulated = result.good;
+                best_p3d = result.p3d;
             } else if result.num_good > second_best_good {
                 second_best_good = result.num_good;
             }
@@ -265,6 +282,7 @@ impl TwoViewReconstruction {
             Some(ReconstructResult {
                 t21: pose_from_rt(&vr[best_solution_idx], &vt[best_solution_idx]),
                 triangulated: best_triangulated,
+                p3d: best_p3d,
             })
         } else {
             None
@@ -333,6 +351,7 @@ impl TwoViewReconstruction {
                 return Some(ReconstructResult {
                     t21: pose_from_rt(r, t),
                     triangulated: chosen.good.clone(),
+                    p3d: chosen.p3d.clone(),
                 });
             }
         }

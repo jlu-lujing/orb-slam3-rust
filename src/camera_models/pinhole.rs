@@ -4,7 +4,7 @@ use crate::two_view_reconstruction::{ReconstructResult, TwoViewReconstruction};
 use nalgebra::{Matrix2x3, Matrix3, Point2, Point3, Vector3};
 use opencv::core::{KeyPointTraitConst, Mat, Point2f, Point3f};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pinhole {
@@ -12,7 +12,7 @@ pub struct Pinhole {
     id: u64,
     camera_type: Type,
     #[serde(skip)]
-    tvr: Option<TwoViewReconstruction>,
+    tvr: Arc<Mutex<Option<TwoViewReconstruction>>>,
 }
 
 impl GeometricCamera for Pinhole {
@@ -24,7 +24,7 @@ impl GeometricCamera for Pinhole {
             parameters: Vec::with_capacity(4),
             id: next_geometric_camera_id(),
             camera_type: Type::Pinhole,
-            tvr: None,
+            tvr: Arc::new(Mutex::new(None)),
         }
     }
     fn with_params(params: Vec<f32>) -> Self
@@ -38,7 +38,7 @@ impl GeometricCamera for Pinhole {
             parameters: params,
             id: next_geometric_camera_id(),
             camera_type: Type::Pinhole,
-            tvr: None,
+            tvr: Arc::new(Mutex::new(None)),
         }
     }
     fn as_any(&self) -> &dyn std::any::Any {
@@ -102,20 +102,17 @@ impl GeometricCamera for Pinhole {
     }
 
     fn reconstruct_with_two_views(
-        &mut self,
+        &self,
         keys1: &Vec<opencv::core::KeyPoint>,
         keys2: &Vec<opencv::core::KeyPoint>,
         matches: &Vec<Option<usize>>,
     ) -> Option<ReconstructResult> {
-        if self.tvr.is_none() {
+        let mut tvr = self.tvr.lock().ok()?;
+        if tvr.is_none() {
             let k = self.to_k_n();
-            self.tvr = Some(TwoViewReconstruction::new(k));
+            *tvr = Some(TwoViewReconstruction::new(k));
         }
-        if let Some(tvr) = &mut self.tvr {
-            tvr.reconstruct(&keys1, &keys2, matches)
-        } else {
-            None
-        }
+        tvr.as_mut()?.reconstruct(keys1, keys2, matches)
     }
 
     fn to_k(&self) -> Mat {
@@ -225,7 +222,7 @@ impl Pinhole {
             parameters: other.parameters.clone(),
             id: next_geometric_camera_id(),
             camera_type: Type::Pinhole,
-            tvr: None,
+            tvr: Arc::new(Mutex::new(None)),
         }
     }
 }

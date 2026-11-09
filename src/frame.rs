@@ -475,8 +475,8 @@ impl Frame {
                 time_orb_ext,
                 #[cfg(feature = "register-times")]
                 time_stereo_match,
-                img_left: None,
-                img_right: None,
+                img_left: Some(im_left.clone()),
+                img_right: Some(im_right.clone()),
             },
         ))
     }
@@ -559,7 +559,7 @@ impl Frame {
                 time_orb_ext,
                 #[cfg(feature = "register-times")]
                 time_stereo_match: 0.0,
-                img_left: None,
+                img_left: Some(im_gray.clone()),
                 img_right: None,
             },
         ))
@@ -644,7 +644,7 @@ impl Frame {
                 time_orb_ext,
                 #[cfg(feature = "register-times")]
                 time_stereo_match: 0.0,
-                img_left: None,
+                img_left: Some(im_gray.clone()),
                 img_right: None,
             },
         ))

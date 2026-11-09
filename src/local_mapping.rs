@@ -49,9 +49,9 @@ use std::time::Duration;
 use tracing::info;
 
 use crate::{
-    atlas::Atlas, geometric_tools, imu_types::Bias, key_frame::KeyFrame, loop_closing::LoopClosing,
-    map::Map, map_point::MapPoint, optimizer, orb_matcher::OrbMatcher, system::System,
-    tracking::Tracking,
+    atlas::Atlas, geometric_tools, imu_types::Bias, key_frame::KeyFrame,
+    key_frame_database::KeyFrameId, loop_closing::LoopClosing, map::Map, map_point::MapPoint,
+    optimizer, orb_matcher::OrbMatcher, system::System, tracking::Tracking,
 };
 
 /// Reset-request state
@@ -99,6 +99,7 @@ struct ImuInitState {
     // For debugging (erased in normal mode upstream).
     init_fr: usize,
     idx_iteration: usize,
+    last_scale_refine: f64,
 
     not_ba1: bool,
     not_ba2: bool,
@@ -127,6 +128,7 @@ impl ImuInitState {
             matches_inliers: 0,
             init_fr: 0,
             idx_iteration: 0,
+            last_scale_refine: -1.0,
             not_ba1: true,
             not_ba2: true,
             info_inertial: SMatrix::zeros(),
@@ -384,6 +386,38 @@ impl LocalMapping {
                     {
                         let prior_a = if self.monocular { 1e10 } else { 1e5 };
                         self.initialize_imu(1e2, prior_a, true);
+                    }
+
+                    if self.inertial
+                        && self.monocular
+                        && current_keyframe
+                            .get_map()
+                            .is_some_and(|map| map.is_imu_initialized())
+                    {
+                        let elapsed = self.imu_init.lock().unwrap().t_init;
+                        let in_refinement_window = [
+                            (25.0, 25.5),
+                            (35.0, 35.5),
+                            (45.0, 45.5),
+                            (55.0, 55.5),
+                            (65.0, 65.5),
+                            (75.0, 75.5),
+                        ]
+                        .iter()
+                        .any(|(start, end)| elapsed > *start && elapsed < *end);
+                        if in_refinement_window {
+                            let should_refine = {
+                                let mut imu = self.imu_init.lock().unwrap();
+                                let ready = elapsed - imu.last_scale_refine >= 5.0;
+                                if ready {
+                                    imu.last_scale_refine = elapsed;
+                                }
+                                ready
+                            };
+                            if should_refine {
+                                self.scale_refinement();
+                            }
+                        }
                     }
 
                     // Redundant-keyframe culling is a separate mapping stage.
@@ -905,18 +939,23 @@ impl LocalMapping {
             return;
         };
 
-        // Inertial culling must merge two Preintegrated measurements and relink
-        // the temporal chain as one atomic operation. Until that API is added,
-        // retaining inertial keyframes is safer than corrupting the IMU graph.
-        if self.inertial {
-            return;
-        }
-
         let init_kf_id = current
             .get_map()
             .map(|map| map.get_init_kf_id())
             .unwrap_or(0);
         let redundant_ratio = 0.9;
+        let last_window_id = if self.inertial {
+            let mut last = current.clone();
+            for _ in 0..21 {
+                let Some(previous) = last.get_prev_kf() else {
+                    break;
+                };
+                last = previous;
+            }
+            last.id
+        } else {
+            u64::MAX
+        };
 
         for kf in current.get_vector_covisible_keyframes() {
             if kf.id == init_kf_id || kf.is_bad() {
@@ -974,7 +1013,49 @@ impl LocalMapping {
             }
 
             if n_map_points > 0 && n_redundant as f32 > redundant_ratio * n_map_points as f32 {
+                if !self.inertial {
+                    kf.set_bad_flag();
+                    if let Some(database) = self.atlas.get_key_frame_database() {
+                        database.erase(KeyFrameId(kf.id), &kf.bow_vec);
+                    }
+                    continue;
+                }
+                let Some(map) = kf.get_map() else {
+                    continue;
+                };
+                if map.key_frames_in_map() <= 21 || kf.id > current.id.saturating_sub(2) {
+                    continue;
+                }
+                let (Some(previous), Some(next)) = (kf.get_prev_kf(), kf.get_next_kf()) else {
+                    continue;
+                };
+                let temporal_span = next.timestamp - previous.timestamp;
+                let merge_for_initialization =
+                    map.is_imu_initialized() && kf.id < last_window_id && temporal_span < 3.0;
+                let merge_for_short_interval = temporal_span < 0.5;
+                let merge_for_low_motion = !map.get_inertial_ba2()
+                    && (kf.get_imu_position() - previous.get_imu_position()).norm() < 0.02
+                    && temporal_span < 3.0;
+                if !(merge_for_initialization || merge_for_short_interval || merge_for_low_motion) {
+                    continue;
+                }
+                let (Some(previous_preintegrated), Some(next_preintegrated)) = (
+                    previous.get_imu_preintegrated(),
+                    next.get_imu_preintegrated(),
+                ) else {
+                    continue;
+                };
+                let mut merged = next_preintegrated.as_ref().clone();
+                merged.merge_previous(&previous_preintegrated);
+                next.set_imu_preintegrated(Some(Arc::new(merged)));
+                next.set_prev_kf(&previous);
+                previous.set_next_kf(&next);
+                kf.clear_prev_kf();
+                kf.clear_next_kf();
                 kf.set_bad_flag();
+                if let Some(database) = self.atlas.get_key_frame_database() {
+                    database.erase(KeyFrameId(kf.id), &kf.bow_vec);
+                }
             }
         }
     }
@@ -1077,7 +1158,7 @@ impl LocalMapping {
                 let Some(previous) = kf.get_prev_kf() else {
                     continue;
                 };
-                let Some(preintegrated) = &kf.imu_preintegrated else {
+                let Some(preintegrated) = kf.get_imu_preintegrated() else {
                     continue;
                 };
                 gravity_direction -=
@@ -1182,7 +1263,44 @@ impl LocalMapping {
         map.increase_change_index();
         self.initializing.store(false, Ordering::SeqCst);
     }
-    fn scale_refinement(&self) {}
+    fn scale_refinement(&self) {
+        if self.reset.lock().unwrap().reset_requested {
+            return;
+        }
+        let Some(current) = self.get_curr_kf() else {
+            return;
+        };
+        let Some(map) = current.get_map() else {
+            return;
+        };
+        if !map.is_imu_initialized() {
+            return;
+        }
+        self.initializing.store(true, Ordering::SeqCst);
+        while self.check_new_key_frames() {
+            self.process_new_key_frame();
+        }
+        let mut rwg = Matrix3::<f64>::identity();
+        let mut scale = 1.0;
+        optimizer::inertial_optimization_gravity_scale(&map, &mut rwg, &mut scale);
+        if scale >= 0.1 && scale.is_finite() && (scale - 1.0).abs() > 0.002 {
+            let rotation = UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix_unchecked(
+                rwg.transpose().cast::<f32>(),
+            ));
+            map.apply_scaled_rotation(
+                Isometry3::from_parts(Translation3::new(0.0, 0.0, 0.0), rotation),
+                scale as f32,
+                true,
+            );
+            if let Some(tracker) = self.tracker.get().and_then(Weak::upgrade)
+                && let Ok(mut tracker) = tracker.lock()
+            {
+                tracker.update_frame_imu(scale as f32, current.get_imu_bias(), current.clone());
+            }
+        }
+        map.increase_change_index();
+        self.initializing.store(false, Ordering::SeqCst);
+    }
 }
 
 fn keyframe_keypoint(kf: &KeyFrame, idx: usize) -> &KeyPoint {

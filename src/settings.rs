@@ -865,28 +865,32 @@ fn read_param_mat(storage: &FileStorage, node: &str) -> Option<Mat> {
     None
 }
 
-// Converts a 4×4 Mat (CV_64F row-major) into an Isometry3
+// Converts a 4×4 floating-point Mat into an Isometry3.
 // The matrix layout is:
 // [ R  t ]
 // [ 0  1 ]
 // where R is 3×3 rotation and t is 3×1 translation.
 fn mat4x4_to_isometry3(mat: &Mat) -> Isometry3<f32> {
-    // YAML matrices are written as f64 (CV_64F) by OpenCV.
+    // OpenCV retains the YAML scalar type. Normalize both the f32 matrices
+    // used by the C++ samples and f64 matrices to one access type.
+    let mut mat64 = Mat::default();
+    mat.convert_to(&mut mat64, CV_64F, 1.0, 0.0)
+        .expect("convert calibration matrix to f64");
     let r = Matrix3::new(
-        *mat.at_2d::<f64>(0, 0).expect("T_b_c1 row 0 col 0") as f32,
-        *mat.at_2d::<f64>(0, 1).expect("T_b_c1 row 0 col 1") as f32,
-        *mat.at_2d::<f64>(0, 2).expect("T_b_c1 row 0 col 2") as f32,
-        *mat.at_2d::<f64>(1, 0).expect("T_b_c1 row 1 col 0") as f32,
-        *mat.at_2d::<f64>(1, 1).expect("T_b_c1 row 1 col 1") as f32,
-        *mat.at_2d::<f64>(1, 2).expect("T_b_c1 row 1 col 2") as f32,
-        *mat.at_2d::<f64>(2, 0).expect("T_b_c1 row 2 col 0") as f32,
-        *mat.at_2d::<f64>(2, 1).expect("T_b_c1 row 2 col 1") as f32,
-        *mat.at_2d::<f64>(2, 2).expect("T_b_c1 row 2 col 2") as f32,
+        *mat64.at_2d::<f64>(0, 0).expect("T_b_c1 row 0 col 0") as f32,
+        *mat64.at_2d::<f64>(0, 1).expect("T_b_c1 row 0 col 1") as f32,
+        *mat64.at_2d::<f64>(0, 2).expect("T_b_c1 row 0 col 2") as f32,
+        *mat64.at_2d::<f64>(1, 0).expect("T_b_c1 row 1 col 0") as f32,
+        *mat64.at_2d::<f64>(1, 1).expect("T_b_c1 row 1 col 1") as f32,
+        *mat64.at_2d::<f64>(1, 2).expect("T_b_c1 row 1 col 2") as f32,
+        *mat64.at_2d::<f64>(2, 0).expect("T_b_c1 row 2 col 0") as f32,
+        *mat64.at_2d::<f64>(2, 1).expect("T_b_c1 row 2 col 1") as f32,
+        *mat64.at_2d::<f64>(2, 2).expect("T_b_c1 row 2 col 2") as f32,
     );
     let t = Translation3::new(
-        *mat.at_2d::<f64>(0, 3).expect("T_b_c1 row 0 col 3") as f32,
-        *mat.at_2d::<f64>(1, 3).expect("T_b_c1 row 1 col 3") as f32,
-        *mat.at_2d::<f64>(2, 3).expect("T_b_c1 row 2 col 3") as f32,
+        *mat64.at_2d::<f64>(0, 3).expect("T_b_c1 row 0 col 3") as f32,
+        *mat64.at_2d::<f64>(1, 3).expect("T_b_c1 row 1 col 3") as f32,
+        *mat64.at_2d::<f64>(2, 3).expect("T_b_c1 row 2 col 3") as f32,
     );
     // from_matrix_unchecked is safe here: the source matrix is a rotation read
     // from a calibration file and is assumed to be orthonormal.
@@ -1072,6 +1076,21 @@ mod tests {
 
     fn approx(a: f32, b: f32) -> bool {
         (a - b).abs() <= 1e-4_f32.max(b.abs() * 1e-4)
+    }
+
+    #[test]
+    fn calibration_matrix_accepts_f32_storage() {
+        let mat = Mat::from_slice_2d(&[
+            &[1.0f32, 0.0, 0.0, 0.1],
+            &[0.0, 1.0, 0.0, 0.2],
+            &[0.0, 0.0, 1.0, 0.3],
+            &[0.0, 0.0, 0.0, 1.0],
+        ])
+        .unwrap();
+        let transform = mat4x4_to_isometry3(&mat);
+        assert!(approx(transform.translation.x, 0.1));
+        assert!(approx(transform.translation.y, 0.2));
+        assert!(approx(transform.translation.z, 0.3));
     }
 
     // Pinhole monocular

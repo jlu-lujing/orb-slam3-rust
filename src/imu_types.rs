@@ -431,6 +431,10 @@ impl Preintegrated {
         self.b
     }
 
+    pub fn total_dt(&self) -> f32 {
+        self.dt
+    }
+
     pub fn get_updated_bias(&self) -> Bias {
         self.bu
     }

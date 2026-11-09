@@ -7,7 +7,7 @@ use opencv::{
     },
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::{
     camera_models::{GeometricCamera, Type, next_geometric_camera_id},
@@ -19,7 +19,7 @@ pub struct KannalaBrandt8 {
     id: u64,
     camera_type: Type,
     #[serde(skip)]
-    tvr: Option<TwoViewReconstruction>,
+    tvr: Arc<Mutex<Option<TwoViewReconstruction>>>,
     precision: f32,
     #[serde(default = "default_lapping_area")]
     pub lapping_area: Vec<usize>,
@@ -119,7 +119,7 @@ impl KannalaBrandt8 {
             parameters: params,
             id: next_geometric_camera_id(),
             camera_type: Type::Fisheye,
-            tvr: None,
+            tvr: Arc::new(Mutex::new(None)),
             precision: precision,
             lapping_area: vec![2, 0],
         }
@@ -211,7 +211,7 @@ impl GeometricCamera for KannalaBrandt8 {
             parameters: Vec::with_capacity(8),
             id: next_geometric_camera_id(),
             camera_type: Type::Fisheye,
-            tvr: None,
+            tvr: Arc::new(Mutex::new(None)),
             precision: 1e-6,
             lapping_area: vec![2, 0],
         }
@@ -227,7 +227,7 @@ impl GeometricCamera for KannalaBrandt8 {
             parameters: params,
             id: next_geometric_camera_id(),
             camera_type: Type::Fisheye,
-            tvr: None,
+            tvr: Arc::new(Mutex::new(None)),
             precision: 1e-6,
             lapping_area: vec![2, 0],
         }
@@ -370,14 +370,15 @@ impl GeometricCamera for KannalaBrandt8 {
     }
 
     fn reconstruct_with_two_views(
-        &mut self,
+        &self,
         keys1: &Vec<opencv::core::KeyPoint>,
         keys2: &Vec<opencv::core::KeyPoint>,
         matches: &Vec<Option<usize>>,
     ) -> Option<ReconstructResult> {
-        if self.tvr.is_none() {
+        let mut tvr = self.tvr.lock().ok()?;
+        if tvr.is_none() {
             let k = self.to_k_n();
-            self.tvr = Some(TwoViewReconstruction::new(k));
+            *tvr = Some(TwoViewReconstruction::new(k));
         }
 
         // Correct FishEye distortion
@@ -423,11 +424,7 @@ impl GeometricCamera for KannalaBrandt8 {
             kp.set_pt(pts2_ud.get(i).ok()?);
         }
 
-        if let Some(tvr) = &mut self.tvr {
-            tvr.reconstruct(&keys_un1, &keys_un2, matches)
-        } else {
-            None
-        }
+        tvr.as_mut()?.reconstruct(&keys_un1, &keys_un2, matches)
     }
 
     fn to_k(&self) -> Mat {

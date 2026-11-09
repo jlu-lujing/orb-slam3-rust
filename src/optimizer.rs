@@ -1253,7 +1253,7 @@ fn gather_inertial_kfs(
         // Link to the previous chain keyframe only if it is the array predecessor.
         let preint = if i > 0 {
             match kf.get_prev_kf() {
-                Some(p) if p.id == arcs[i - 1].id => kf.imu_preintegrated.clone(),
+                Some(p) if p.id == arcs[i - 1].id => kf.get_imu_preintegrated(),
                 _ => None,
             }
         } else {
@@ -2787,7 +2787,7 @@ pub fn full_inertial_ba(
         let (Some(&ci), Some(&pi)) = (kf_index.get(&kf.id), kf_index.get(&prev.id)) else {
             continue;
         };
-        let Some(preint) = kf.imu_preintegrated.clone() else {
+        let Some(preint) = kf.get_imu_preintegrated() else {
             continue;
         };
         links.push(InertialLink {
@@ -2947,7 +2947,7 @@ pub fn local_inertial_ba(
         let (Some(&ci), Some(&pi)) = (kf_index.get(&wkf.id), kf_index.get(&prev.id)) else {
             continue;
         };
-        let Some(preint) = wkf.imu_preintegrated.clone() else {
+        let Some(preint) = wkf.get_imu_preintegrated() else {
             continue;
         };
         // Boundary link (window edge) or bRecInit: robust kernel; boundary also
@@ -3352,7 +3352,7 @@ pub fn merge_inertial_ba(
         let (Some(&ci), Some(&pi)) = (kf_index.get(&k.id), kf_index.get(&prev.id)) else {
             continue;
         };
-        let Some(preint) = k.imu_preintegrated.clone() else {
+        let Some(preint) = k.get_imu_preintegrated() else {
             continue;
         };
         links.push(InertialLink {

@@ -46,7 +46,7 @@ pub(crate) fn peek_next_id() -> usize {
 }
 /// Restore the global map-point-id counter (after deserialization).
 pub(crate) fn set_next_id(v: usize) {
-    NEXT_ID.store(v, Ordering::SeqCst);
+    NEXT_ID.fetch_max(v, Ordering::SeqCst);
 }
 
 /// A live observation: an observing keyframe and its `(left, right)` indices.
@@ -904,6 +904,20 @@ mod tests {
 
         mp.set_normal_vector(Vector3::new(0.0, 0.0, 1.0));
         assert_vec(mp.get_normal(), [0.0, 0.0, 1.0], 1e-6);
+    }
+
+    #[test]
+    fn tracking_scratch_is_thread_safe() {
+        let point = MapPoint::new();
+        point.set_track_in_view(true);
+        point.set_track_proj_x(123.5);
+        point.set_track_depth(7.25);
+        point.set_last_frame_seen(42);
+
+        assert!(point.track_in_view());
+        assert_eq!(point.track_proj_x(), 123.5);
+        assert_eq!(point.track_depth(), 7.25);
+        assert_eq!(point.last_frame_seen(), 42);
     }
 
     #[test]

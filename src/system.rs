@@ -10,7 +10,7 @@ use std::sync::{
 use std::thread::JoinHandle;
 use std::{
     fs::File,
-    io::{self, Read},
+    io::{self, Read, Write},
     path::Path,
 };
 use tracing::info;
@@ -24,7 +24,7 @@ use crate::{
     orb_vocabulary::{OrbVocabulary, VocabularyError},
     settings::{Settings, SettingsError},
     tracking::{Tracking, TrackingState},
-    viewer::Viewer,
+    viewer::{Viewer, ViewerSnapshot},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +65,20 @@ pub enum SystemError {
     InvalidORBVocabulary(VocabularyError),
     AtlasLoad(AtlasLoadError),
 }
+
+impl std::fmt::Display for SystemError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SystemError::InvalidSettings(error) => write!(formatter, "invalid settings: {error:?}"),
+            SystemError::InvalidORBVocabulary(error) => {
+                write!(formatter, "invalid ORB vocabulary: {error:?}")
+            }
+            SystemError::AtlasLoad(error) => write!(formatter, "failed to load Atlas: {error:?}"),
+        }
+    }
+}
+
+impl std::error::Error for SystemError {}
 
 impl System {
     // TODO: handle initFr and strSequence
@@ -245,6 +259,43 @@ impl System {
         tracking.grab_image_stereo(image_left, image_right, timestamp, filename.into())
     }
 
+    pub fn track_monocular(
+        &self,
+        image: Mat,
+        timestamp: f64,
+        imu_measurements: &[Point],
+        filename: impl Into<String>,
+    ) -> Option<nalgebra::Isometry3<f32>> {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return None;
+        }
+        let tracking = self.tracking.get()?.clone();
+        let mut tracking = tracking.lock().unwrap();
+        for measurement in imu_measurements {
+            tracking.grab_imu_data(Point::new(measurement.a, measurement.w, measurement.t));
+        }
+        tracking.grab_image_monocular(image, timestamp, filename.into())
+    }
+
+    pub fn track_rgbd(
+        &self,
+        image: Mat,
+        depth: Mat,
+        timestamp: f64,
+        imu_measurements: &[Point],
+        filename: impl Into<String>,
+    ) -> Option<nalgebra::Isometry3<f32>> {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return None;
+        }
+        let tracking = self.tracking.get()?.clone();
+        let mut tracking = tracking.lock().unwrap();
+        for measurement in imu_measurements {
+            tracking.grab_imu_data(Point::new(measurement.a, measurement.w, measurement.t));
+        }
+        tracking.grab_image_rgbd(image, depth, timestamp, filename.into())
+    }
+
     pub fn grab_imu_data(&self, measurement: Point) {
         if let Some(tracking) = self.tracking.get()
             && let Ok(mut tracking) = tracking.lock()
@@ -254,15 +305,19 @@ impl System {
     }
 
     pub fn tracking_state(&self) -> Option<TrackingState> {
-        self.tracking
-            .get()
-            .map(|tracking| tracking.lock().unwrap().get_tracking_state())
+        self.tracking.get().and_then(|tracking| {
+            tracking
+                .lock()
+                .ok()
+                .map(|tracking| tracking.get_tracking_state())
+        })
     }
 
     pub fn is_lost(&self) -> bool {
         self.tracking
             .get()
-            .is_some_and(|tracking| tracking.lock().unwrap().is_lost())
+            .and_then(|tracking| tracking.lock().ok().map(|tracking| tracking.is_lost()))
+            .unwrap_or(true)
     }
 
     pub fn get_atlas(&self) -> Arc<Atlas> {
@@ -275,6 +330,15 @@ impl System {
 
     pub fn get_local_mapping(&self) -> Option<Arc<LocalMapping>> {
         self.local_mapping.get().cloned()
+    }
+
+    pub fn viewer_snapshot(&self) -> Option<ViewerSnapshot> {
+        self.tracking.get().and_then(|tracking| {
+            tracking
+                .lock()
+                .ok()
+                .map(|tracking| tracking.viewer_snapshot())
+        })
     }
 
     pub fn activate_localization_mode(&self) {
@@ -340,6 +404,75 @@ impl System {
         self.shutdown.load(Ordering::SeqCst)
     }
 
+    pub fn save_trajectory_tum(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let trajectory = self
+            .tracking
+            .get()
+            .map(|tracking| tracking.lock().unwrap().frame_trajectory())
+            .unwrap_or_default();
+        write_tum_trajectory(path, &trajectory)
+    }
+
+    pub fn save_keyframe_trajectory_tum(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let trajectory = self
+            .tracking
+            .get()
+            .map(|tracking| tracking.lock().unwrap().keyframe_trajectory())
+            .unwrap_or_default();
+        write_tum_trajectory(path, &trajectory)
+    }
+
+    pub fn save_trajectory_euroc(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        self.save_trajectory_tum(path)
+    }
+
+    pub fn save_keyframe_trajectory_euroc(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        self.save_keyframe_trajectory_tum(path)
+    }
+
+    pub fn save_trajectory_kitti(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let trajectory = self
+            .tracking
+            .get()
+            .map(|tracking| tracking.lock().unwrap().frame_trajectory())
+            .unwrap_or_default();
+        let mut file = File::create(path)?;
+        for (_, pose) in trajectory {
+            let r = pose.rotation.to_rotation_matrix().into_inner();
+            let t = pose.translation.vector;
+            writeln!(
+                file,
+                "{:.9e} {:.9e} {:.9e} {:.9e} {:.9e} {:.9e} {:.9e} {:.9e} {:.9e} {:.9e} {:.9e} {:.9e}",
+                r[(0, 0)],
+                r[(0, 1)],
+                r[(0, 2)],
+                t[0],
+                r[(1, 0)],
+                r[(1, 1)],
+                r[(1, 2)],
+                t[1],
+                r[(2, 0)],
+                r[(2, 1)],
+                r[(2, 2)],
+                t[2],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn save_atlas(&self, path: impl AsRef<Path>) -> Result<(), SystemSaveError> {
+        let path = path.as_ref();
+        let checksum = calculate_checksum(&self.vocabulary_file_path)?;
+        let snapshot = SessionSnapshotRef {
+            file_voc: self.vocabulary_file_path.to_string_lossy().into_owned(),
+            file_voc_checksum: checksum,
+            atlas: &self.atlas,
+        };
+        let bytes = postcard::to_allocvec(&snapshot)?;
+        fs::write(format!("{}.postcard", path.display()), bytes)?;
+        Ok(())
+    }
+
     /// Minimal system handle for unit tests that exercise another component's
     /// wiring without loading the ORB vocabulary or settings files.
     #[cfg(test)]
@@ -367,6 +500,35 @@ impl System {
         }
     }
 }
+
+#[derive(Debug)]
+pub enum SystemSaveError {
+    Io(io::Error),
+    Postcard(postcard::Error),
+}
+
+impl From<io::Error> for SystemSaveError {
+    fn from(error: io::Error) -> Self {
+        SystemSaveError::Io(error)
+    }
+}
+
+impl From<postcard::Error> for SystemSaveError {
+    fn from(error: postcard::Error) -> Self {
+        SystemSaveError::Postcard(error)
+    }
+}
+
+impl std::fmt::Display for SystemSaveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SystemSaveError::Io(error) => write!(formatter, "I/O error: {error}"),
+            SystemSaveError::Postcard(error) => write!(formatter, "serialization error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for SystemSaveError {}
 
 impl Drop for System {
     fn drop(&mut self) {
@@ -406,6 +568,30 @@ struct SessionSnapshot {
     file_voc: String,
     file_voc_checksum: String,
     atlas: Atlas,
+}
+
+#[derive(Serialize)]
+struct SessionSnapshotRef<'a> {
+    file_voc: String,
+    file_voc_checksum: String,
+    atlas: &'a Atlas,
+}
+
+fn write_tum_trajectory(
+    path: impl AsRef<Path>,
+    trajectory: &[(f64, nalgebra::Isometry3<f32>)],
+) -> io::Result<()> {
+    let mut file = File::create(path)?;
+    for (timestamp, pose) in trajectory {
+        let t = pose.translation.vector;
+        let q = pose.rotation.quaternion();
+        writeln!(
+            file,
+            "{timestamp:.9} {:.9} {:.9} {:.9} {:.9} {:.9} {:.9} {:.9}",
+            t.x, t.y, t.z, q.i, q.j, q.k, q.w
+        )?;
+    }
+    Ok(())
 }
 
 fn load_atlas(
