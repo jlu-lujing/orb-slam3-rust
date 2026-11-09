@@ -345,7 +345,7 @@ impl Atlas {
             if !current_map.is_bad() {
                 return current_map;
             }
-            // TODO: why do we spin lock here?
+            // Another thread is replacing the active map; wait for it to finish.
             std::thread::sleep(Duration::from_micros(3000));
         }
     }

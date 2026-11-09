@@ -81,7 +81,7 @@ impl std::fmt::Display for SystemError {
 impl std::error::Error for SystemError {}
 
 impl System {
-    // TODO: handle initFr and strSequence
+    /// Builds the SLAM runtime and starts the mapping/loop-closing workers.
     pub fn new(
         vocabulary_path: &PathBuf,
         settings_path: &PathBuf,

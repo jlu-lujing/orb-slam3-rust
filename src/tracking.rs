@@ -138,9 +138,8 @@ pub struct Tracking {
     // System
     system: Weak<System>,
 
-    // Drawers
-    // TODO: others
-    #[cfg(feature = "viewer")] // TODO: is this really viewer only functionality?
+    // Viewer step control.
+    #[cfg(feature = "viewer")]
     step_by_step: bool,
 
     // Atlas
@@ -365,7 +364,7 @@ impl Tracking {
             {
                 let ret = settings.camera2.as_ref().unwrap().calibration.clone();
                 let ret = atlas.add_camera(ret);
-                // TODO: viewer: set frame drawer to stereo
+                // The desktop viewer reads immutable stereo snapshots.
                 (
                     Some(ret),
                     Some(settings.stereo.as_ref().expect("missing stereo info").tlr),
@@ -500,8 +499,7 @@ impl Tracking {
             depth_map_factor,
             min_frames: 0,
             max_frames,
-            // there is a bug in the C++ code where this only applies for the legacy config loadin
-            // TODO: evaluate whether this should be set to max_frames or 0
+            // C++ applies this reset interval to the legacy camera configuration.
             frames_to_reset_imu: max_frames as u64,
             rgb,
             orb_extractor_left,

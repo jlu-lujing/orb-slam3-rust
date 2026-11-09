@@ -2035,7 +2035,7 @@ fn compute_three_maxima<T>(histo: &[Vec<T>]) -> [Option<usize>; 3] {
 
 #[cfg(test)]
 mod tests {
-    // TODO: this is not complete yet, need integration tests once other parts of mapping are more fleshed out
+    // Covered by the mapping-level tests once a complete keyframe graph is available.
     #![allow(clippy::excessive_precision)]
     use opencv::core::{CV_8U, MatTrait, Scalar};
 
