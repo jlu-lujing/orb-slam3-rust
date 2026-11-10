@@ -358,7 +358,7 @@ impl Map {
     ///
     /// Every observation that references a keyframe belonging to a *different*
     /// map (or a bad keyframe) is dropped, so the snapshot produced by
-    /// [`Map::to_snapshot`] is self-contained. The pointer→id conversion itself is
+    /// `Map::to_snapshot` is self-contained. The pointer→id conversion itself is
     /// done lazily by `to_snapshot`, so there is no separate backup-vector step
     /// (the C++ `mvpBackupKeyFrames` / `mvpBackupMapPoints`).
     pub fn pre_save(&self, _cams: &[Arc<dyn GeometricCamera>]) {
@@ -379,7 +379,7 @@ impl Map {
     /// Finalize a freshly deserialized map (`Map::PostLoad`, external-resource part).
     ///
     /// The keyframe / map-point graph and every back-pointer are already wired
-    /// by [`Map::from_snapshot`]; this step only registers each keyframe with the
+    /// by `Map::from_snapshot`; this step only registers each keyframe with the
     /// keyframe database (C++ `pKFDB->add(pKFi)`). The ORB vocabulary is accepted
     /// for parity with the C++ signature but is already embedded in the database.
     pub fn post_load(

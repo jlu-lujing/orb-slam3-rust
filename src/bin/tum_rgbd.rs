@@ -41,7 +41,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let associations = matches.get_one::<String>("associations").expect("default");
     let sequence = TumRgbdSequence::load(&dataset, associations)?;
     let mono = matches.get_flag("mono");
-    let sensor = if mono { Sensor::Monocular } else { Sensor::RGBD };
+    let sensor = if mono {
+        Sensor::Monocular
+    } else {
+        Sensor::RGBD
+    };
     let system = System::new(&vocabulary, &settings, sensor, true, None)?;
     if matches.get_flag("localization") {
         system.activate_localization_mode();

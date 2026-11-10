@@ -1427,10 +1427,7 @@ impl Tracking {
         // correspondences per frame than the reference, so the wider window
         // tips it into aliased matches on the repeated-plate texture.
         if self.atlas.is_imu_initialized().unwrap_or(false) {
-            let ba2 = self
-                .atlas
-                .get_current_map()
-                .get_inertial_ba2();
+            let ba2 = self.atlas.get_current_map().get_inertial_ba2();
             th = if ba2 { 2.0 } else { 6.0 };
         } else if matches!(
             self.sensor,
@@ -2663,7 +2660,12 @@ fn export_keyframe_trajectory(
     timestamp_scale: f64,
     normalize_origin: bool,
 ) -> Vec<(f64, Isometry3<f32>)> {
-    export_keyframe_trajectory_from(map.get_all_key_frames(), imu_body, timestamp_scale, normalize_origin)
+    export_keyframe_trajectory_from(
+        map.get_all_key_frames(),
+        imu_body,
+        timestamp_scale,
+        normalize_origin,
+    )
 }
 
 /// Same as [`export_keyframe_trajectory`] but over an explicit keyframe list,

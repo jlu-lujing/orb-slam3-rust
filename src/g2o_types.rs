@@ -1351,7 +1351,7 @@ type Matrix15 = nalgebra::SMatrix<f64, 15, 15>;
 type Vector15 = nalgebra::SVector<f64, 15>;
 
 /// 15-DoF prior linking `[VP, VV, VG, VA]` to a stored pose/velocity/bias with a
-/// full information matrix (`EdgePriorPoseImu`, from a [`ConstraintPoseImu`]).
+/// full information matrix (`EdgePriorPoseImu`, the port of ORB-SLAM3's `ConstraintPoseImu`).
 pub struct EdgePriorPoseImu {
     vertices: [usize; 4],
     information: Matrix15,

@@ -312,10 +312,10 @@ same data it is not possible to tell whether that is a remaining defect or just
 this low-texture, repetitive scene. Stereo inputs are absent entirely, and the
 inertial paths need EuRoC-format IMU data that the workspace does not contain.
 
-## Verification on the target machine (nx1)
+## Verification on the target machine
 
 The reference implementation was finally built and instrumented on the Jetson
-target (`nx1`, aarch64, 8 cores) inside the same `orb-slam3-simulation:ubuntu22.04`
+target (Orin NX, aarch64, 8 cores) inside the same `orb-slam3-simulation:ubuntu22.04`
 image used to produce the stored baselines. One `std::cerr` line was added at the
 end of `Tracking::Track` (frame id, state, `mnMatchesInliers`, keyframe count,
 timestamp) so the two trackers can be compared frame by frame.
@@ -339,13 +339,13 @@ the reference 0.0055 m against the port's 0.0035 m.
 
 ## Both implementations on the target machine
 
-`nx1` (Jetson Orin NX, aarch64, 8 cores) now carries both sides:
+The Jetson target now carries both sides:
 
 - the reference, built inside `orb-slam3-simulation:ubuntu22.04` from the same
   patched tree used for the stored baselines, plus one `std::cerr` trace line
-  (`~/orb-ref`);
+  (`~/orb-ref` in a scratch directory);
 - this port, `cargo build --release --bins` natively on the Jetson
-  (`~/orb-rs`).
+  (`~/orb-rs` in a scratch directory).
 
 Making the port build there needed one portability fix: OpenCV 4.9 added a
 trailing `AlgorithmHint` argument to `gaussianBlur`/`cvtColor`, and the `opencv`
@@ -357,7 +357,7 @@ the hint only when the bindings expect it.
 
 Same binary source, two OpenCV versions, two machines:
 
-| sequence | macOS / OpenCV 4.11 | nx1 / OpenCV 4.8 |
+| sequence | development host / OpenCV 4.11 | Jetson target / OpenCV 4.8 |
 | --- | --- | --- |
 | `edge_v6` | 0.000355 | 0.000355 |
 | `run02` | 0.002453 | 0.002453 |

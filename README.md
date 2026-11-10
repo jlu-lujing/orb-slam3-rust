@@ -50,16 +50,27 @@ If you use ORB-SLAM3 in an academic work, please cite:
 
 # 2. Prerequisites
 
-You need a recent Rust compiler, OpenCV 4.x, and Clang/`libclang`. The desktop
-viewer supports macOS and Linux through `eframe` + `wgpu`.
+You need a recent Rust compiler (1.85+, edition 2024), OpenCV 4.5 or newer,
+and Clang/`libclang` (the `opencv` crate's build script parses the OpenCV
+headers). `build.rs` probes `pkg-config --modversion opencv4` and adapts to the
+`AlgorithmHint` argument that OpenCV 4.9 added, so both 4.5-4.8 and 4.9+ work;
+set `OPENCV_PKGCONFIG_NAME` if your development package is not named `opencv4`.
+The desktop viewer supports macOS and Linux through `eframe` + `wgpu`.
 
 # 3. Building ORB-SLAM3-RS library and examples
 
 ```bash
-git clone --recurse-submodules git@github.com:jlu-lujing/orb-slam3-rust.git
+git clone https://github.com/jlu-lujing/orb-slam3-rust.git
 cd orb-slam3-rust
-cargo build
+cargo build --release
 ```
+
+The C++ reference in `3rdparty/ORB_SLAM3` is a submodule and is only needed for
+parity work; the Rust crate builds without it. Fetch it with
+`git submodule update --init --recursive` if you want to compare against it.
+
+The vocabulary is shipped compressed and unpacked by `build.rs` on the first
+build, so the first build is slower than later ones.
 
 # 4. Running ORB-SLAM3-RS with your camera
 
@@ -103,14 +114,37 @@ left/right fisheye image display, inertial and loop graph overlays, single-step
 debugging, drag-and-drop sequence loading, and trajectory/Atlas export.
 
 The original C++ implementation is available at `3rdparty/ORB_SLAM3` as a Git
-submodule:
+submodule (see above).
 
-```bash
-git submodule update --init --recursive
-```
+The ORB vocabulary in `vocabulary/` is the one distributed with ORB-SLAM3
+(`DBoW2` format) and carries the same GPLv3 terms.
 
 See [PARITY_AUDIT.md](PARITY_AUDIT.md) for the current method-level comparison,
 verified areas, intentional architectural differences, and remaining risks.
+
+### Status
+
+Measured against a reference ORB-SLAM3 build on the same data, this port is at or
+ahead on every RGB-D sequence tried so far (six of seven clearly, one inside the
+reference's own run-to-run spread) and tracks the long sequence end to end where
+the reference loses a fifth of it. `PARITY_AUDIT.md` lists the exact numbers, the
+single intentional divergence (`SearchLocalPoints` search window for RGB-D) and
+the paths that could not be validated here (stereo, inertial, and loop closing
+beyond a synthetic revisit sequence).
+
+Contributions are welcome; run `cargo fmt`, `clippy -D warnings` and the test
+suite before opening a pull request.
+
+### Testing
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
+```
+
+The integration tests under `tests/` compare the ported optimizers against g2o
+fixtures. CI runs the same commands on Ubuntu with the system OpenCV.
 
 Quantitative trajectory comparison is available with:
 

@@ -1,7 +1,9 @@
 # AGENTS.md — orb-slam3-rs
 
-A Rust (edition 2024) port of ORB-SLAM3. Single-crate project with one library
-(`src/lib.rs`) and one binary (`src/bin/stereo_inertial_euroc.rs`).
+A Rust (edition 2024) port of ORB-SLAM3. Single crate: one library
+(`src/lib.rs`) plus the binaries listed under `[[bin]]` in `Cargo.toml`
+(`stereo_inertial_euroc`, `tum_rgbd`, `trajectory_eval`, and `slam_viewer`
+behind the `gui` feature).
 
 ---
 
@@ -48,7 +50,8 @@ cargo clippy -- -D warnings
 
 ## Test Commands
 
-No tests exist yet. When tests are added, use:
+The suite is unit tests inline in `src/` plus integration tests in `tests/`
+(optimizer parity against g2o fixtures). Use:
 
 ```bash
 # Run all tests
@@ -80,15 +83,21 @@ src/
   lib.rs                         # Public module re-exports
   settings.rs                    # YAML config parsing (SettingsError)
   system.rs                      # Top-level System struct (Sensor, SystemError)
-  two_view_reconstruction.rs     # Homography/fundamental matrix estimation
-  camera_models/
-    mod.rs                       # GeometricCamera trait, CameraType enum
-    pinhole.rs                   # PinholeCamera implementation
-    kannala_brandt8.rs           # Stub (not yet implemented)
+  tracking.rs                    # Tracking thread
+  local_mapping.rs               # LocalMapping thread
+  loop_closing.rs                # LoopClosing thread
+  atlas.rs / map.rs / key_frame.rs / map_point.rs
+  optimizer.rs                   # g2o-derived optimizers
+  orb_extractor/ orb_matcher.rs  # ORB extraction and matching
+  evaluation.rs                  # ATE/RPE
   bin/
-    stereo_inertial_euroc.rs     # Binary entry point (clap CLI, tracing init)
+    stereo_inertial_euroc.rs     # EuRoC stereo-inertial runner
+    tum_rgbd.rs                  # TUM RGB-D (and `--mono`) runner
+    trajectory_eval.rs           # ATE/RPE CLI
+    slam_viewer.rs               # Desktop viewer (`gui` feature)
 config/
   euroc.yaml                     # EuRoC dataset camera/IMU configuration
+tests/                           # Integration tests (optimizer parity fixtures)
 vocabulary/
   orbvoc.txt.tar.gz              # Compressed ORB vocabulary (tracked by git)
 ```

@@ -100,11 +100,13 @@ impl<'de> Deserialize<'de> for Atlas {
 }
 
 /// Magic bytes prefixing a serialized atlas blob (`"ORBA"`).
-const ATLAS_MAGIC: [u8; 4] = *b"ORBA";
+/// Magic bytes at the start of a serialized atlas (`"ORBA"`).
+pub const ATLAS_MAGIC: [u8; 4] = *b"ORBA";
 /// On-disk schema version. Bump whenever a `*Snapshot` layout changes so that
 /// older blobs fail loudly instead of decoding to garbage (the wire format is
 /// not self-describing).
-const ATLAS_FORMAT_VERSION: u32 = 1;
+/// Version of the serialized atlas header produced by [`Atlas::to_bytes`].
+pub const ATLAS_FORMAT_VERSION: u32 = 1;
 
 /// Error returned by [`Atlas::to_bytes`] / [`Atlas::from_bytes`].
 #[derive(Debug)]
@@ -414,7 +416,7 @@ impl Atlas {
     /// Advances `last_init_kf_id_map` past the current map's keyframes, drops
     /// empty maps, and runs each surviving map's observation cleanup
     /// ([`Map::pre_save`]). The actual pointer→id conversion happens lazily in
-    /// the [`Serialize`] implementation via [`Map::to_snapshot`]. Call this before
+    /// the [`Serialize`] implementation via `Map::to_snapshot`. Call this before
     /// serializing the atlas.
     pub fn pre_save(&self) {
         // Collect the maps to discard while holding the lock, then release it
@@ -458,7 +460,7 @@ impl Atlas {
     /// Finalize the atlas after deserialization (`Atlas::PostLoad`).
     ///
     /// The map / keyframe / map-point graph is rebuilt during deserialization
-    /// (see [`Map::from_snapshot`]); this only registers each map's keyframes with
+    /// (see `Map::from_snapshot`); this only registers each map's keyframes with
     /// the keyframe database. Requires [`set_key_frame_database`] and
     /// [`set_orb_vocabulary`] to have been called first.
     ///
@@ -476,7 +478,7 @@ impl Atlas {
     }
 
     /// Serialize the atlas to a self-contained binary blob (magic + version
-    /// header followed by a postcard-encoded [`AtlasSnapshot`]).
+    /// header followed by a postcard-encoded `AtlasSnapshot`).
     ///
     /// Call [`pre_save`](Atlas::pre_save) first to drop empty maps and clean up
     /// cross-map observations.
@@ -765,7 +767,7 @@ mod tests {
     }
 
     /// Round-trip a map with a non-trivial graph through the snapshot form
-    /// ([`Map::to_snapshot`] / [`Map::from_snapshot`]) — the pointer↔id conversion
+    /// (`Map::to_snapshot` / `Map::from_snapshot`) — the pointer↔id conversion
     /// that backs the atlas [`Serialize`] / [`Deserialize`] impls — and assert
     /// ids, the covisibility graph, the spanning tree, observations, origins and
     /// the camera link are preserved.

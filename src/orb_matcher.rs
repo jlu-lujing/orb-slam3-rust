@@ -1305,7 +1305,6 @@ impl OrbMatcher {
                 matches21[best_idx2 as usize] = i1 as i32;
                 matched_distance[best_idx2 as usize] = best_dist;
                 n_matches += 1;
-
             }
         }
 

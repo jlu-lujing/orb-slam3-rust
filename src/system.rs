@@ -728,10 +728,10 @@ impl System {
             .tracking
             .get()
             .map(|tracking| {
-                tracking.lock().unwrap().frame_trajectory_for_export_all_maps(
-                    self.uses_imu_body_trajectory(),
-                    1e9,
-                )
+                tracking
+                    .lock()
+                    .unwrap()
+                    .frame_trajectory_for_export_all_maps(self.uses_imu_body_trajectory(), 1e9)
             })
             .unwrap_or_default();
         write_tum_trajectory(path, &trajectory)

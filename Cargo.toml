@@ -2,7 +2,17 @@
 name = "orb_slam3_rs"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 build = "build.rs"
+description = "A Rust reimplementation of ORB-SLAM3 (visual, visual-inertial and multi-map SLAM)"
+repository = "https://github.com/jlu-lujing/orb-slam3-rust"
+readme = "README.md"
+license = "GPL-3.0-only"
+keywords = ["slam", "orb-slam3", "computer-vision", "robotics", "rgbd"]
+categories = ["computer-vision", "science::robotics"]
+# The ORB vocabulary ships as a 40 MiB archive and the C++ reference lives in a
+# git submodule; neither belongs in a crates.io package.
+exclude = ["3rdparty/ORB_SLAM3", "vocabulary/orbvoc.txt", "vocabulary/orbvoc.txt.tar.gz"]
 
 [dependencies]
 clap = { version = "4.6.0", features = ["derive"] }
