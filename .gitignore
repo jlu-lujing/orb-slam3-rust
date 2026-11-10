@@ -6,3 +6,6 @@ notes.txt
 /KeyFrameTrajectory.txt
 /f_dataset*_CameraTrajectory.txt
 /f_dataset*_KeyFrameTrajectory.txt
+
+# Optional local checkout of the C++ reference (not part of the crate)
+/3rdparty

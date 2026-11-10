@@ -2,7 +2,7 @@
 
 Audit date: 2026-11-10
 
-Reference: `3rdparty/ORB_SLAM3` at `4452a3c4ab75`
+Reference: ORB-SLAM3 (upstream `UZ-SLAMLab/ORB_SLAM3`) at commit `4452a3c4ab75`, built separately
 
 This document distinguishes code completeness from accuracy parity. The Rust
 port is independently implemented, so bit-identical trajectories are not the
@@ -12,7 +12,7 @@ statistically indistinguishable (mostly better) trajectories, and that every
 remaining difference is named and measured.
 
 Reference numbers in this file were produced against a C++ build of
-`3rdparty/ORB_SLAM3`, repeatedly, because that implementation is itself
+upstream ORB-SLAM3, repeatedly, because that implementation is itself
 nondeterministic (2-3x spread on the hardest sequence for a single binary). The
 trajectories are medians of at least three runs.
 

@@ -65,9 +65,12 @@ cd orb-slam3-rust
 cargo build --release
 ```
 
-The C++ reference in `3rdparty/ORB_SLAM3` is a submodule and is only needed for
-parity work; the Rust crate builds without it. Fetch it with
-`git submodule update --init --recursive` if you want to compare against it.
+The C++ reference is **not** vendored here. If you want to compare against it,
+clone it next to the crate (it is not needed to build or run this one):
+
+```bash
+git clone --depth 1 https://github.com/UZ-SLAMLab/ORB_SLAM3.git ../ORB_SLAM3
+```
 
 The vocabulary is shipped compressed and unpacked by `build.rs` on the first
 build, so the first build is slower than later ones.
@@ -113,8 +116,9 @@ It supports localization mode, reset, orbit/zoom navigation, track following,
 left/right fisheye image display, inertial and loop graph overlays, single-step
 debugging, drag-and-drop sequence loading, and trajectory/Atlas export.
 
-The original C++ implementation is available at `3rdparty/ORB_SLAM3` as a Git
-submodule (see above).
+The original C++ implementation lives at
+<https://github.com/UZ-SLAMLab/ORB_SLAM3> and is not vendored in this repository
+(see above).
 
 The ORB vocabulary in `vocabulary/` is the one distributed with ORB-SLAM3
 (`DBoW2` format) and carries the same GPLv3 terms.
