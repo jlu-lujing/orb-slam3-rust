@@ -12,6 +12,7 @@ env:
 jobs:
   test:
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -22,8 +23,16 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update -qq
+          if pkg-config --exists opencv4; then
+            echo "OpenCV already available: $(pkg-config --modversion opencv4)"
+          else
+            # `DPkg::Lock::Timeout` waits for the periodic apt jobs on the runner
+            # instead of failing immediately.
+            sudo apt-get install -y --no-install-recommends \
+              -o DPkg::Lock::Timeout=300 libopencv-dev
+          fi
           sudo apt-get install -y --no-install-recommends \
-            libopencv-dev clang libclang-dev pkg-config
+            -o DPkg::Lock::Timeout=300 clang libclang-dev pkg-config
 
       - uses: dtolnay/rust-toolchain@stable
         with:
