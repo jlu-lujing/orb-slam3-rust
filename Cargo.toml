@@ -32,3 +32,7 @@ gui = ["viewer", "dep:eframe"]
 name = "slam_viewer"
 path = "src/bin/slam_viewer.rs"
 required-features = ["gui"]
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
