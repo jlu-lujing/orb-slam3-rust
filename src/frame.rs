@@ -898,11 +898,18 @@ impl Frame {
     // --- Pose -----------------------------------------------------------
 
     /// Set the camera pose `Tcw`. The IMU pose is not modified.
-    pub fn set_pose(&mut self, t_cw: Isometry3<f32>) {
+    pub fn set_pose(&mut self, mut t_cw: Isometry3<f32>) {
+        t_cw.rotation = nalgebra::UnitQuaternion::new_normalize(*t_cw.rotation.quaternion());
         self.t_cw = t_cw;
         self.update_pose_matrices();
         self.is_set = true;
         self.has_pose = true;
+    }
+
+    /// Mark this frame as having no valid camera pose.
+    pub(crate) fn clear_pose(&mut self) {
+        self.is_set = false;
+        self.has_pose = false;
     }
 
     /// Set IMU pose (`Rwb`, `twb`) and velocity, implicitly setting the camera pose.
@@ -1957,7 +1964,7 @@ mod tests {
     #![allow(clippy::excessive_precision)]
     use std::sync::Arc;
 
-    use nalgebra::Vector3;
+    use nalgebra::{Quaternion, Translation3, UnitQuaternion, Vector3};
     use opencv::core::KeyPointTrait;
 
     use super::*;
@@ -2005,6 +2012,20 @@ mod tests {
         );
         assert!(f.has_pose());
         assert!(f.is_set());
+    }
+
+    #[test]
+    fn set_pose_normalizes_non_unit_rotation_input() {
+        let mut frame = build_frame();
+        let invalid = UnitQuaternion::new_unchecked(Quaternion::new(0.0, 0.0, 0.0, 2.0));
+        frame.set_pose(Isometry3::from_parts(
+            Translation3::new(1.0, 2.0, 3.0),
+            invalid,
+        ));
+        let pose = frame.get_pose();
+        let q = pose.rotation.quaternion();
+        assert!((q.norm() - 1.0).abs() < 1e-6);
+        assert!(frame.get_pose().rotation.angle().is_finite());
     }
 
     #[test]

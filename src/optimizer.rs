@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use nalgebra::{Isometry3, Matrix2, Matrix3, Vector2, Vector3};
 use opencv::prelude::*;
+use tracing::debug;
 
 use crate::camera_models::GeometricCamera;
 use crate::frame::Frame;
@@ -112,6 +113,26 @@ pub fn pose_optimization(frame: &mut Frame) -> i32 {
         };
         let xw = mp.get_world_pos().cast::<f64>();
         frame.outlier[i] = false;
+
+        // A map point that does not project into the image cannot contribute a
+        // meaningful reprojection residual, and as it approaches the optical
+        // axis its Jacobian (`fx / z`) explodes and dominates the normal
+        // equations. Without this filter a single bad correspondence of that
+        // kind can drag the whole pose out of the correct basin: on the
+        // 180-frame `steel_plate_lab_run02` sequence such outliers appear
+        // whenever the camera turns and previously destroyed tracking.
+        let x_c = (frame.get_pose() * nalgebra::Point3::from(mp.get_world_pos())).coords;
+        if x_c.z < 0.01 {
+            frame.outlier[i] = true;
+            continue;
+        }
+        let uv = frame.camera.project_n(&nalgebra::Point3::from(x_c));
+        let bounds = &frame.constants.bounds;
+        if uv.x < bounds.min_x || uv.x > bounds.max_x || uv.y < bounds.min_y || uv.y > bounds.max_y
+        {
+            frame.outlier[i] = true;
+            continue;
+        }
 
         if !has_rig {
             let kp = &frame.keys_un.as_ref().unwrap()[i];
@@ -733,6 +754,11 @@ pub fn local_bundle_adjustment(
     optimizer.initialize_optimization(0);
     optimizer.optimize(10);
 
+    // Match LocalBundleAdjustment's commit critical section: the solver may
+    // run concurrently with tracking, but neither observations nor optimized
+    // geometry may be mutated midway through a tracking step.
+    let _map_update = map.map_update.lock().unwrap();
+
     // --- Cull outlier observations ---
     let mut to_erase: Vec<(Arc<KeyFrame>, Arc<MapPoint>)> = Vec::new();
     for rec in &recs {
@@ -747,7 +773,6 @@ pub fn local_bundle_adjustment(
         ekf.erase_map_point_match(emp);
         emp.erase_observation(ekf);
     }
-
     // --- Recover optimized keyframe poses ---
     for lkf in &local_kfs {
         let vi = kf_vertex[&lkf.id];
@@ -774,6 +799,15 @@ pub fn local_bundle_adjustment(
         mp.update_normal_and_depth();
     }
 
+    debug!(
+        keyframe_id = kf.id,
+        local_keyframes = local_kfs.len(),
+        fixed_keyframes = fixed_kfs.len(),
+        local_map_points = local_mps.len(),
+        edges = num_edges,
+        erased_observations = to_erase.len(),
+        "local bundle adjustment"
+    );
     map.increase_change_index();
     (num_fixed_kf, num_opt_kf, local_mps.len(), num_edges)
 }

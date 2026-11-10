@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
-use nalgebra::Translation3;
+use nalgebra::{Similarity3, Translation3};
 
 use crate::atlas::Atlas;
 use crate::g2o_core::Sim3;
@@ -20,6 +20,7 @@ use crate::map_point::MapPoint;
 use crate::optimizer::{self, KeyFrameAndPose, LoopConnections};
 use crate::orb_matcher::OrbMatcher;
 use crate::orb_vocabulary::{BowVector, OrbVocabulary};
+use crate::sim3_solver::Sim3Solver;
 
 pub struct LoopClosing {
     atlas: Arc<Atlas>,
@@ -35,7 +36,8 @@ pub struct LoopClosing {
     finished: AtomicBool,
     running_loop: AtomicBool,
     last_processed: Mutex<Option<u64>>,
-    pending_match: Mutex<Option<PendingMatch>>,
+    pending_loop: Mutex<Option<PendingMatch>>,
+    pending_merge: Mutex<Option<PendingMatch>>,
     gba_running: Arc<AtomicBool>,
     gba_stop: Arc<AtomicBool>,
     gba_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -44,8 +46,15 @@ pub struct LoopClosing {
 #[derive(Debug, Clone)]
 struct PendingMatch {
     candidate_group: HashSet<u64>,
-    last_current_id: u64,
+    last_seen_id: u64,
     count: u8,
+    not_found: u8,
+}
+
+#[derive(Clone, Copy)]
+enum DetectionKind {
+    Loop,
+    Merge,
 }
 
 impl LoopClosing {
@@ -70,7 +79,8 @@ impl LoopClosing {
             finished: AtomicBool::new(true),
             running_loop: AtomicBool::new(false),
             last_processed: Mutex::new(None),
-            pending_match: Mutex::new(None),
+            pending_loop: Mutex::new(None),
+            pending_merge: Mutex::new(None),
             gba_running: Arc::new(AtomicBool::new(false)),
             gba_stop: Arc::new(AtomicBool::new(false)),
             gba_thread: Mutex::new(None),
@@ -156,7 +166,8 @@ impl LoopClosing {
     fn reset_if_requested(&self) {
         if self.reset_all.swap(false, Ordering::SeqCst) {
             self.key_frames.lock().unwrap().clear();
-            self.pending_match.lock().unwrap().take();
+            self.pending_loop.lock().unwrap().take();
+            self.pending_merge.lock().unwrap().take();
         }
         let reset_map = self.reset_active_map.lock().unwrap().take();
         if let Some(map) = reset_map {
@@ -172,7 +183,10 @@ impl LoopClosing {
         let Some(map) = current.get_map() else {
             return;
         };
-        if map.key_frames_in_map() < 10 {
+        if map.is_inertial() && !map.get_inertial_ba2() {
+            return;
+        }
+        if map.key_frames_in_map() < 12 {
             return;
         }
 
@@ -181,54 +195,91 @@ impl LoopClosing {
             .database
             .detect_n_best_candidates(&view, KeyFrameId(current.id), 5);
         if self.active_loop_closing {
+            let mut loop_geometry_found = false;
             for candidate in candidates.loop_ {
-                if let Some(loop_kf) = view.key_frames.get(&candidate).cloned()
-                    && let Some(sim3) = self.detect_sim3(&current, &loop_kf)
-                    && self.confirm_candidate(
-                        current.id,
-                        &Self::loop_neighborhood(&loop_kf)
-                            .into_iter()
-                            .map(|keyframe| keyframe.id)
-                            .collect(),
-                    )
-                {
-                    tracing::info!(
-                        "Loop detected: current KF {} matched KF {}",
-                        current.id,
-                        loop_kf.id
-                    );
-                    self.correct_loop(&current, &loop_kf, sim3);
-                    break;
+                let Some(loop_kf) = view.key_frames.get(&candidate).cloned() else {
+                    continue;
+                };
+                if let Some((sim3, common_regions)) = self.detect_sim3(&current, &loop_kf) {
+                    loop_geometry_found = true;
+                    if common_regions >= 3
+                        || self.confirm_candidate(
+                            DetectionKind::Loop,
+                            current.id,
+                            common_regions,
+                            &Self::loop_neighborhood(&loop_kf)
+                                .into_iter()
+                                .map(|keyframe| keyframe.id)
+                                .collect(),
+                        )
+                    {
+                        tracing::info!(
+                            "Loop detected: current KF {} matched KF {}",
+                            current.id,
+                            loop_kf.id
+                        );
+                        self.correct_loop(&current, &loop_kf, sim3);
+                        break;
+                    }
                 }
             }
+            if !loop_geometry_found {
+                self.record_candidate_miss(DetectionKind::Loop, current.id);
+            }
+
+            let mut merge_geometry_found = false;
             for candidate in candidates.merge {
-                if let Some(merge_kf) = view.key_frames.get(&candidate).cloned()
-                    && let Some(sim3) = self.detect_sim3(&current, &merge_kf)
-                    && self.confirm_candidate(
-                        current.id,
-                        &Self::loop_neighborhood(&merge_kf)
-                            .into_iter()
-                            .map(|keyframe| keyframe.id)
-                            .collect(),
-                    )
-                {
-                    self.merge_maps(&current, &merge_kf, sim3);
-                    break;
+                let Some(merge_kf) = view.key_frames.get(&candidate).cloned() else {
+                    continue;
+                };
+                if let Some((sim3, common_regions)) = self.detect_sim3(&current, &merge_kf) {
+                    merge_geometry_found = true;
+                    if common_regions >= 3
+                        || self.confirm_candidate(
+                            DetectionKind::Merge,
+                            current.id,
+                            common_regions,
+                            &Self::loop_neighborhood(&merge_kf)
+                                .into_iter()
+                                .map(|keyframe| keyframe.id)
+                                .collect(),
+                        )
+                    {
+                        self.merge_maps(&current, &merge_kf, sim3);
+                        break;
+                    }
                 }
+            }
+            if !merge_geometry_found {
+                self.record_candidate_miss(DetectionKind::Merge, current.id);
             }
         }
     }
 
-    fn confirm_candidate(&self, current_id: u64, candidate_group: &HashSet<u64>) -> bool {
-        let mut pending = self.pending_match.lock().unwrap();
+    fn confirm_candidate(
+        &self,
+        kind: DetectionKind,
+        current_id: u64,
+        common_regions: u8,
+        candidate_group: &HashSet<u64>,
+    ) -> bool {
+        let pending = match kind {
+            DetectionKind::Loop => &self.pending_loop,
+            DetectionKind::Merge => &self.pending_merge,
+        };
+        let mut pending = pending.lock().unwrap();
+        let initial_count = common_regions.max(1);
         let count = match pending.as_ref() {
             Some(previous)
                 if !previous.candidate_group.is_disjoint(candidate_group)
-                    && current_id > previous.last_current_id =>
+                    && current_id > previous.last_seen_id =>
             {
-                previous.count.saturating_add(1)
+                previous
+                    .count
+                    .max(initial_count.saturating_sub(1))
+                    .saturating_add(1)
             }
-            _ => 1,
+            _ => initial_count,
         };
         if count >= 3 {
             *pending = None;
@@ -236,49 +287,188 @@ impl LoopClosing {
         } else {
             *pending = Some(PendingMatch {
                 candidate_group: candidate_group.clone(),
-                last_current_id: current_id,
+                last_seen_id: current_id,
                 count,
+                not_found: 0,
             });
             false
         }
     }
 
-    fn detect_sim3(&self, current: &Arc<KeyFrame>, candidate: &Arc<KeyFrame>) -> Option<Sim3> {
+    fn record_candidate_miss(&self, kind: DetectionKind, current_id: u64) {
+        let pending = match kind {
+            DetectionKind::Loop => &self.pending_loop,
+            DetectionKind::Merge => &self.pending_merge,
+        };
+        let mut pending = pending.lock().unwrap();
+        let Some(previous) = pending.as_mut() else {
+            return;
+        };
+        if current_id <= previous.last_seen_id {
+            return;
+        }
+        previous.last_seen_id = current_id;
+        previous.not_found = previous.not_found.saturating_add(1);
+        if previous.not_found >= 2 {
+            *pending = None;
+        }
+    }
+
+    fn detect_sim3(
+        &self,
+        current: &Arc<KeyFrame>,
+        candidate: &Arc<KeyFrame>,
+    ) -> Option<(Sim3, u8)> {
         if current.id == candidate.id || current.is_bad() || candidate.is_bad() {
             return None;
         }
-        let pose = current.get_pose();
-        let current_sim_f32 =
-            nalgebra::Similarity3::from_parts(pose.translation, pose.rotation, 1.0_f32);
-        let mut sim3 = Sim3::new(
-            pose.rotation.cast::<f64>(),
-            pose.translation.vector.cast::<f64>(),
-            1.0,
-        );
-        let points = Self::loop_points(&Self::loop_neighborhood(candidate));
-        let mut matches = vec![None; current.n];
-        let matcher = OrbMatcher::new(0.75, true);
-        if matcher.search_by_projection_similarity_loop_detection(
-            current,
-            &current_sim_f32,
-            &points,
-            &mut matches,
-            8.0,
-            0.75,
-        ) < 20
+
+        let bow_matcher = OrbMatcher::new(0.9, true);
+        let candidate_neighbors = Self::loop_neighborhood(candidate);
+        let current_connected: HashSet<_> = current
+            .get_connected_keyframes()
+            .into_iter()
+            .map(|keyframe| keyframe.id)
+            .collect();
+        if candidate_neighbors
+            .iter()
+            .any(|keyframe| current_connected.contains(&keyframe.id))
         {
             return None;
         }
+
+        // Upstream combines BoW matches from the matched keyframe and its ten
+        // best covisible neighbours before running three-point Sim3 RANSAC.
+        let mut bow_matches = vec![None; current.n];
+        let mut matched_keyframes = vec![None; current.n];
+        let mut seen_map_points = HashSet::new();
+        let mut total_bow_matches = 0;
+        let mut strongest_keyframe = candidate.clone();
+        let mut strongest_matches = 0;
+        for keyframe in &candidate_neighbors {
+            let mut keyframe_matches = Vec::new();
+            let num_matches =
+                bow_matcher.search_by_bow_keyframe(current, keyframe, &mut keyframe_matches);
+            if num_matches > strongest_matches {
+                strongest_matches = num_matches;
+                strongest_keyframe = keyframe.clone();
+            }
+            for (index, matched) in keyframe_matches.into_iter().enumerate() {
+                let Some(point) = matched else {
+                    continue;
+                };
+                if seen_map_points.insert(point.id) {
+                    bow_matches[index] = Some(point);
+                    matched_keyframes[index] = Some(keyframe.clone());
+                    total_bow_matches += 1;
+                }
+            }
+        }
+        if total_bow_matches < 20 {
+            return None;
+        }
+
+        let mut solver = Sim3Solver::new(
+            current,
+            candidate,
+            &bow_matches,
+            self.fix_scale,
+            Some(&matched_keyframes),
+        );
+        solver.set_ransac_parameters(0.99, 15, 300);
+        let coarse = solver.find();
+        if !coarse.converged {
+            return None;
+        }
+        let mut scm = coarse.transform;
+
+        let candidate_sim = optimizer::sim3_from_pose(&strongest_keyframe.get_pose());
+        let mut scw = scm.mul(&candidate_sim);
+        let mut points = Vec::new();
+        let mut point_keyframes = Vec::new();
+        let mut seen_points = HashSet::new();
+        for keyframe in &candidate_neighbors {
+            for point in keyframe.get_map_points() {
+                if seen_points.insert(point.id) {
+                    points.push(point);
+                    point_keyframes.push(keyframe.clone());
+                }
+            }
+        }
+
+        let matcher = OrbMatcher::new(0.75, true);
+        let mut matches = vec![None; current.n];
+        let mut matched_keyframes = vec![None; current.n];
+        let projected = matcher.search_by_projection_similarity_loop_closing_merging(
+            current,
+            &sim3_to_similarity(&scw),
+            &points,
+            &point_keyframes,
+            &mut matches,
+            &mut matched_keyframes,
+            8.0,
+            1.5,
+        );
+        if projected < 50 {
+            return None;
+        }
+
         let inliers = optimizer::optimize_sim3(
             current,
             candidate,
             &mut matches,
-            &mut sim3,
+            &mut scm,
             10.0,
             self.fix_scale,
             true,
         );
-        (inliers >= 20).then_some(sim3)
+        if inliers < 20 {
+            return None;
+        }
+        scw = scm.mul(&candidate_sim);
+
+        // Refined projection search is the final common-region gate in
+        // `DetectCommonRegionsFromBoW`.
+        let mut refined_matches = vec![None; current.n];
+        let projected_refined = matcher.search_by_projection_similarity_loop_closing_merging(
+            current,
+            &sim3_to_similarity(&scw),
+            &points,
+            &point_keyframes,
+            &mut refined_matches,
+            &mut matched_keyframes,
+            5.0,
+            1.0,
+        );
+        if projected_refined < 80 {
+            return None;
+        }
+
+        let twc = current.get_pose_inverse();
+        let mut common_regions = 0u8;
+        for keyframe in current.get_best_covisibility_keyframes(10) {
+            let tjc = keyframe.get_pose() * twc;
+            let sjw = optimizer::sim3_from_pose(&tjc).mul(&scw);
+            let mut keyframe_matches = vec![None; keyframe.n];
+            let mut keyframe_matched_keyframes = vec![None; keyframe.n];
+            let num_matches = matcher.search_by_projection_similarity_loop_closing_merging(
+                &keyframe,
+                &sim3_to_similarity(&sjw),
+                &points,
+                &point_keyframes,
+                &mut keyframe_matches,
+                &mut keyframe_matched_keyframes,
+                3.0,
+                1.5,
+            );
+            if num_matches >= 30 {
+                common_regions += 1;
+                if common_regions >= 3 {
+                    break;
+                }
+            }
+        }
+        Some((scw, common_regions))
     }
 
     fn merge_maps(&self, current: &Arc<KeyFrame>, candidate: &Arc<KeyFrame>, sim3: Sim3) {
@@ -294,11 +484,15 @@ impl LoopClosing {
             return;
         }
 
+        // `sim3` maps the matched map's world into the current camera. The
+        // transform for moving the source map into the target world is
+        // S_target<-source = Scw^-1 * Tcw_current.
+        let source_to_target = merge_source_alignment(current, &sim3);
         let transform = nalgebra::Isometry3::from_parts(
-            nalgebra::Translation3::from(sim3.translation().cast::<f32>()),
-            sim3.rotation().cast::<f32>(),
+            nalgebra::Translation3::from(source_to_target.translation().cast::<f32>()),
+            source_to_target.rotation().cast::<f32>(),
         );
-        source.apply_scaled_rotation(transform, sim3.scale() as f32, true);
+        source.apply_scaled_rotation(transform, source_to_target.scale() as f32, true);
         let (keyframes, points) = source.take_contents();
         for keyframe in &keyframes {
             keyframe.update_map(target.clone());
@@ -350,6 +544,7 @@ impl LoopClosing {
             return;
         }
 
+        current.update_connections();
         current.add_loop_edge(candidate);
         candidate.add_loop_edge(current);
 
@@ -358,27 +553,22 @@ impl LoopClosing {
             return;
         };
 
-        let candidate_pose = candidate.get_pose();
-        let candidate_sim = Sim3::new(
-            candidate_pose.rotation.cast::<f64>(),
-            candidate_pose.translation.vector.cast::<f64>(),
-            1.0,
-        );
-        let corrected_current = sim3.mul(&candidate_sim);
         let current_neighbors = Self::loop_neighborhood(current);
         let loop_neighbors = Self::loop_neighborhood(candidate);
         let loop_points = Self::loop_points(&loop_neighbors);
         let mut corrected: KeyFrameAndPose = HashMap::new();
-        for keyframe in &current_neighbors {
-            corrected.insert(
-                keyframe.id,
-                sim3.mul(&optimizer::sim3_from_pose(&keyframe.get_pose())),
-            );
+        for keyframe in current_neighbors
+            .iter()
+            .filter(|keyframe| keyframe.id != current.id)
+        {
+            // Propagate the loop correction in the current keyframe's local
+            // frame: Sic = Tiw * Twc, then Scw = Sic * Slw.
+            let tic = keyframe.get_pose() * current.get_pose_inverse();
+            corrected.insert(keyframe.id, optimizer::sim3_from_pose(&tic).mul(&sim3));
         }
-        corrected.insert(current.id, corrected_current);
+        corrected.insert(current.id, sim3);
         let non_corrected: KeyFrameAndPose = current_neighbors
             .iter()
-            .chain(loop_neighbors.iter())
             .map(|keyframe| (keyframe.id, optimizer::sim3_from_pose(&keyframe.get_pose())))
             .collect();
         let mut connections: LoopConnections = HashMap::new();
@@ -413,18 +603,34 @@ impl LoopClosing {
             tracing::info!("Loop closure fused {fused} duplicate map points");
         }
 
-        optimizer::optimize_essential_graph(
-            &map,
-            candidate,
-            current,
-            &non_corrected,
-            &corrected,
-            &connections,
-            self.fix_scale,
-        );
+        if map.is_inertial() && map.is_imu_initialized() {
+            optimizer::optimize_essential_graph_4dof(
+                &map,
+                candidate,
+                current,
+                &non_corrected,
+                &corrected,
+                &connections,
+            );
+        } else {
+            optimizer::optimize_essential_graph(
+                &map,
+                candidate,
+                current,
+                &non_corrected,
+                &corrected,
+                &connections,
+                self.fix_scale,
+            );
+        }
+        map.inform_new_big_change();
         // ORB-SLAM3 launches global BA in a dedicated thread after the
         // essential-graph correction and commits its staged result later.
-        self.start_global_bundle_adjustment(map.clone(), current.id);
+        if !map.is_imu_initialized()
+            || (map.key_frames_in_map() < 200 && self.atlas.count_maps() == 1)
+        {
+            self.start_global_bundle_adjustment(map.clone(), current.id);
+        }
 
         for point in map.get_all_map_points() {
             if !point.is_bad() {
@@ -555,6 +761,20 @@ impl LoopClosing {
     }
 }
 
+fn sim3_to_similarity(transform: &Sim3) -> Similarity3<f32> {
+    Similarity3::from_parts(
+        Translation3::from(transform.translation().cast::<f32>()),
+        transform.rotation().cast::<f32>(),
+        transform.scale() as f32,
+    )
+}
+
+fn merge_source_alignment(current: &KeyFrame, current_from_target: &Sim3) -> Sim3 {
+    current_from_target
+        .inverse()
+        .mul(&optimizer::sim3_from_pose(&current.get_pose()))
+}
+
 pub(crate) struct AtlasKeyFrameView {
     key_frames: HashMap<KeyFrameId, Arc<KeyFrame>>,
     bad_maps: HashSet<MapId>,
@@ -662,11 +882,11 @@ mod tests {
         let loop_closing = LoopClosing::new(atlas, database, vocabulary, true, true);
         let group = HashSet::from([2]);
 
-        assert!(!loop_closing.confirm_candidate(10, &group));
-        assert!(!loop_closing.confirm_candidate(10, &group));
-        assert!(!loop_closing.confirm_candidate(11, &group));
-        assert!(loop_closing.confirm_candidate(12, &group));
-        assert!(!loop_closing.confirm_candidate(13, &group));
+        assert!(!loop_closing.confirm_candidate(DetectionKind::Loop, 10, 1, &group));
+        assert!(!loop_closing.confirm_candidate(DetectionKind::Loop, 10, 1, &group));
+        assert!(!loop_closing.confirm_candidate(DetectionKind::Loop, 11, 1, &group));
+        assert!(loop_closing.confirm_candidate(DetectionKind::Loop, 12, 1, &group));
+        assert!(!loop_closing.confirm_candidate(DetectionKind::Loop, 13, 1, &group));
     }
 
     #[test]
@@ -679,11 +899,49 @@ mod tests {
         let overlapping = HashSet::from([4, 5, 6]);
         let disjoint = HashSet::from([20, 21, 22]);
 
-        assert!(!loop_closing.confirm_candidate(10, &first));
-        assert!(!loop_closing.confirm_candidate(11, &overlapping));
-        assert!(!loop_closing.confirm_candidate(12, &disjoint));
-        assert!(!loop_closing.confirm_candidate(13, &disjoint));
-        assert!(loop_closing.confirm_candidate(14, &disjoint));
+        assert!(!loop_closing.confirm_candidate(DetectionKind::Loop, 10, 1, &first));
+        assert!(!loop_closing.confirm_candidate(DetectionKind::Loop, 11, 1, &overlapping));
+        assert!(!loop_closing.confirm_candidate(DetectionKind::Loop, 12, 1, &disjoint));
+        assert!(!loop_closing.confirm_candidate(DetectionKind::Loop, 13, 1, &disjoint));
+        assert!(loop_closing.confirm_candidate(DetectionKind::Loop, 14, 1, &disjoint));
+    }
+
+    #[test]
+    fn candidate_state_expires_after_two_misses_and_is_category_local() {
+        let atlas = Arc::new(Atlas::from_kf_id(0));
+        let vocabulary = dummy_voc();
+        let database = Arc::new(KeyFrameDatabase::new(vocabulary.clone()));
+        let loop_closing = LoopClosing::new(atlas, database, vocabulary, true, true);
+        let group = HashSet::from([7, 8, 9]);
+
+        assert!(!loop_closing.confirm_candidate(DetectionKind::Loop, 20, 1, &group));
+        loop_closing.record_candidate_miss(DetectionKind::Loop, 21);
+        assert!(!loop_closing.confirm_candidate(DetectionKind::Loop, 22, 1, &group));
+        assert!(
+            loop_closing
+                .pending_loop
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|pending| pending.count == 2)
+        );
+        assert!(loop_closing.pending_merge.lock().unwrap().is_none());
+
+        loop_closing.record_candidate_miss(DetectionKind::Loop, 23);
+        loop_closing.record_candidate_miss(DetectionKind::Loop, 24);
+        assert!(loop_closing.pending_loop.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn common_region_validation_seeds_the_confirmation_count() {
+        let atlas = Arc::new(Atlas::from_kf_id(0));
+        let vocabulary = dummy_voc();
+        let database = Arc::new(KeyFrameDatabase::new(vocabulary.clone()));
+        let loop_closing = LoopClosing::new(atlas, database, vocabulary, true, true);
+        let group = HashSet::from([11, 12, 13]);
+
+        assert!(!loop_closing.confirm_candidate(DetectionKind::Loop, 30, 2, &group));
+        assert!(loop_closing.confirm_candidate(DetectionKind::Loop, 31, 0, &group));
     }
 
     #[test]
@@ -737,6 +995,30 @@ mod tests {
             target.get_id(),
             "merged target should become the active atlas map"
         );
+    }
+
+    #[test]
+    fn merge_alignment_composes_target_world_to_camera_with_source_pose() {
+        let source_map = Arc::new(Map::new());
+        let current = KeyFrame::from_frame(&build_frame(), source_map);
+        let source_pose = nalgebra::Isometry3::from_parts(
+            nalgebra::Translation3::new(1.0, 2.0, 3.0),
+            nalgebra::UnitQuaternion::from_scaled_axis(nalgebra::Vector3::new(0.1, -0.2, 0.3)),
+        );
+        current.set_pose(source_pose);
+
+        let target_from_camera = Sim3::new(
+            nalgebra::UnitQuaternion::from_scaled_axis(nalgebra::Vector3::new(-0.04, 0.03, 0.08)),
+            nalgebra::Vector3::new(-0.3, 0.7, 1.1),
+            1.4,
+        );
+        let source_to_target = merge_source_alignment(&current, &target_from_camera);
+        let source_point = nalgebra::Vector3::new(0.2, -0.4, 5.0);
+        let expected = target_from_camera
+            .inverse()
+            .map(&optimizer::sim3_from_pose(&source_pose).map(&source_point.cast::<f64>()));
+        let actual = source_to_target.map(&source_point.cast::<f64>());
+        assert!((actual - expected).norm() < 1e-7);
     }
 
     #[test]

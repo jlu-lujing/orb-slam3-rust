@@ -75,6 +75,16 @@ cargo run --bin stereo_inertial_euroc -- \
 
 The runner writes `CameraTrajectory.txt` and `KeyFrameTrajectory.txt`.
 
+RGB-D / TUM-style sequence:
+
+```bash
+cargo run --bin tum_rgbd -- \
+  vocabulary/orbvoc.txt \
+  path/to/camera.yaml \
+  path/to/sequence \
+  --associations path/to/associations.txt
+```
+
 Desktop viewer:
 
 ```bash
@@ -101,3 +111,13 @@ git submodule update --init --recursive
 
 See [PARITY_AUDIT.md](PARITY_AUDIT.md) for the current method-level comparison,
 verified areas, intentional architectural differences, and remaining risks.
+
+Quantitative trajectory comparison is available with:
+
+```bash
+cargo run --bin trajectory_eval -- \
+  CameraTrajectory.txt groundtruth.txt --max-diff 0.02 --offset 0.0
+```
+
+EuRoC ground-truth CSV ordering is supported with `--euroc`. The tool reports
+timestamp association count, Umeyama scale, ATE RMSE/mean/median/max, and RPE.

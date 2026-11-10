@@ -14,6 +14,7 @@ pub mod camera_models;
 pub mod compat;
 pub mod converter;
 pub mod euroc;
+pub mod evaluation;
 pub mod frame;
 pub mod g2o_core;
 pub mod g2o_types;
@@ -34,10 +35,12 @@ pub mod orb_vocabulary;
 pub mod pnp;
 pub mod serialization_utils;
 pub mod settings;
+pub mod sim3_solver;
 pub mod system;
 #[cfg(test)]
 mod test_helpers;
 pub mod tracking;
+pub mod tum_rgbd;
 pub mod two_view_reconstruction;
 pub mod viewer;
 

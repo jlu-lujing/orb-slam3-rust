@@ -6,7 +6,7 @@ use opencv::core::{
     ToInputArray, Vector, copy_make_border,
 };
 use opencv::features2d::fast;
-use opencv::imgproc::{INTER_LINEAR, gaussian_blur, resize};
+use opencv::imgproc::{INTER_LINEAR, resize};
 use opencv::prelude::*;
 
 use crate::{
@@ -270,14 +270,13 @@ impl OrbExtractor {
 
             // Preprocess the resized image
             let mut blurred = Mat::default();
-            gaussian_blur(
+            crate::compat::gaussian_blur_compat(
                 &image_pyramid[level],
                 &mut blurred,
                 Size::new(7, 7),
                 2.,
                 2.,
                 BORDER_REFLECT_101,
-                opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
             )
             .unwrap();
 

@@ -695,9 +695,7 @@ impl System {
         if self.sensor == Sensor::Monocular {
             return Err(unsupported_trajectory_format("TUM", self.sensor));
         }
-        let Some(map) = self.largest_map() else {
-            return write_tum_trajectory(path, &[]);
-        };
+        // Upstream `SaveTrajectoryTUM` walks every keyframe in the Atlas.
         let trajectory = self
             .tracking
             .get()
@@ -705,16 +703,13 @@ impl System {
                 tracking
                     .lock()
                     .unwrap()
-                    .frame_trajectory_for_export(&map, false, 1.0)
+                    .frame_trajectory_for_export_all_maps(false, 1.0)
             })
             .unwrap_or_default();
         write_tum_trajectory(path, &trajectory)
     }
 
     pub fn save_keyframe_trajectory_tum(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        let Some(map) = self.largest_map() else {
-            return write_tum_trajectory(path, &[]);
-        };
         let trajectory = self
             .tracking
             .get()
@@ -722,24 +717,42 @@ impl System {
                 tracking
                     .lock()
                     .unwrap()
-                    .keyframe_trajectory_for_export(&map, false, 1.0, false)
+                    .keyframe_trajectory_for_export_all_maps(false, 1.0, false)
             })
             .unwrap_or_default();
         write_tum_trajectory(path, &trajectory)
     }
 
     pub fn save_trajectory_euroc(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        let Some(map) = self.largest_map() else {
-            return write_tum_trajectory(path, &[]);
-        };
-        self.save_trajectory_euroc_for_map(path, &map)
+        let trajectory = self
+            .tracking
+            .get()
+            .map(|tracking| {
+                tracking.lock().unwrap().frame_trajectory_for_export_all_maps(
+                    self.uses_imu_body_trajectory(),
+                    1e9,
+                )
+            })
+            .unwrap_or_default();
+        write_tum_trajectory(path, &trajectory)
     }
 
     pub fn save_keyframe_trajectory_euroc(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        let Some(map) = self.largest_map() else {
-            return write_tum_trajectory(path, &[]);
-        };
-        self.save_keyframe_trajectory_euroc_for_map(path, &map)
+        let trajectory = self
+            .tracking
+            .get()
+            .map(|tracking| {
+                tracking
+                    .lock()
+                    .unwrap()
+                    .keyframe_trajectory_for_export_all_maps(
+                        self.uses_imu_body_trajectory(),
+                        1e9,
+                        false,
+                    )
+            })
+            .unwrap_or_default();
+        write_tum_trajectory(path, &trajectory)
     }
 
     /// Upstream map-specific `SaveTrajectoryEuRoC` overload.
@@ -787,9 +800,6 @@ impl System {
         if self.sensor == Sensor::Monocular {
             return Err(unsupported_trajectory_format("KITTI", self.sensor));
         }
-        let Some(map) = self.largest_map() else {
-            return Ok(());
-        };
         let trajectory = self
             .tracking
             .get()
@@ -797,7 +807,7 @@ impl System {
                 tracking
                     .lock()
                     .unwrap()
-                    .frame_trajectory_for_export(&map, false, 1.0)
+                    .frame_trajectory_for_export_all_maps(false, 1.0)
             })
             .unwrap_or_default();
         let mut file = File::create(path)?;

@@ -356,7 +356,8 @@ impl KeyFrame {
 
     // --- Pose -----------------------------------------------------------
 
-    pub fn set_pose(&self, tcw: Isometry3<f32>) {
+    pub fn set_pose(&self, mut tcw: Isometry3<f32>) {
+        tcw.rotation = nalgebra::UnitQuaternion::new_normalize(*tcw.rotation.quaternion());
         let mut pose = self.pose.write().unwrap();
         pose.tcw = tcw;
         pose.rcw = tcw.rotation.to_rotation_matrix().into_inner();
@@ -594,7 +595,11 @@ impl KeyFrame {
         // the threshold.
         let max = counts
             .values()
-            .max_by_key(|(_, count)| *count)
+            .max_by(|(left, left_count), (right, right_count)| {
+                left_count
+                    .cmp(right_count)
+                    .then_with(|| right.id.cmp(&left.id))
+            })
             .map(|(kf, count)| (kf.clone(), *count))
             .expect("counts is non-empty");
         let mut connected = false;
@@ -651,8 +656,15 @@ impl KeyFrame {
             .values()
             .map(|(w, weight)| (*weight, w.clone()))
             .collect();
-        // Sort ascending by weight, then reverse → descending, dropping bad KFs.
-        pairs.sort_by_key(|(w, _)| *w);
+        // Upstream sorts by (weight, KeyFrame*), then reverses. Pointer order
+        // is allocation order in practice, so use the stable keyframe id as
+        // the deterministic tie-breaker.
+        pairs.sort_by_key(|(weight, weak)| {
+            (
+                *weight,
+                weak.upgrade().map_or(u64::MAX, |keyframe| keyframe.id),
+            )
+        });
         let mut ordered: Vec<(Weak<KeyFrame>, i32)> = Vec::with_capacity(pairs.len());
         for (weight, weak) in pairs.into_iter().rev() {
             if weak.upgrade().is_some_and(|kf| !kf.is_bad()) {

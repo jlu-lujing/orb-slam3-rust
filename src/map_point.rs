@@ -482,13 +482,16 @@ impl MapPoint {
 
     /// `(keyframe, (left, right))` for every observing keyframe still alive.
     pub fn get_observations(&self) -> Vec<(Arc<KeyFrame>, (i32, i32))> {
-        self.feat
+        let mut observations = self
+            .feat
             .read()
             .unwrap()
             .observations
             .values()
             .filter_map(|o| o.kf.upgrade().map(|kf| (kf, (o.left, o.right))))
-            .collect()
+            .collect::<Vec<_>>();
+        observations.sort_by_key(|(keyframe, _)| keyframe.id);
+        observations
     }
 
     // Bad flag / replacement
@@ -605,7 +608,7 @@ impl MapPoint {
     /// Recompute the representative descriptor as the one with the least
     /// median Hamming distance to all observed descriptors.
     pub fn compute_distinctive_descriptors(&self) {
-        let observations = {
+        let mut observations = {
             let feat = self.feat.read().unwrap();
             if feat.bad {
                 return;
@@ -615,6 +618,7 @@ impl MapPoint {
                 .filter_map(|o| o.kf.upgrade().map(|kf| (kf, o.left, o.right)))
                 .collect::<Vec<_>>()
         };
+        observations.sort_by_key(|(keyframe, _, _)| keyframe.id);
         if observations.is_empty() {
             return;
         }
@@ -675,11 +679,12 @@ impl MapPoint {
             if feat.bad {
                 return;
             }
-            let observations = feat
+            let mut observations = feat
                 .observations
                 .values()
                 .filter_map(|o| o.kf.upgrade().map(|kf| (kf, o.left, o.right)))
                 .collect::<Vec<_>>();
+            observations.sort_by_key(|(keyframe, _, _)| keyframe.id);
             (observations, feat.ref_kf.upgrade(), self.get_world_pos())
         };
         if observations.is_empty() {

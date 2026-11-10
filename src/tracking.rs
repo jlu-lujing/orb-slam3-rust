@@ -19,7 +19,6 @@ use crate::{
     viewer::{ViewerFeature, ViewerImage, ViewerKeyFrame, ViewerSnapshot},
 };
 use nalgebra::{Isometry3, Matrix3, Vector3};
-use opencv::imgproc::cvt_color;
 use opencv::prelude::*;
 use opencv::{
     core::{CV_32F, Mat, MatExprTraitConst, Point2f, Point3f, Scalar},
@@ -379,12 +378,7 @@ impl Tracking {
             }
             Sensor::RGBD | Sensor::IMURGBD => {
                 let r = settings.rgbd.as_ref().expect("missing rgbd info");
-                let mut factor = r.depth_map_factor;
-                if factor.abs() < 1e-5 {
-                    factor = 1.
-                } else {
-                    factor = 1. / factor;
-                }
+                let factor = normalize_depth_map_factor(r.depth_map_factor);
                 (Some(r.bf), Some(r.b * r.th_depth), Some(factor))
             }
             _ => (None, None, None),
@@ -583,14 +577,8 @@ impl Tracking {
                 }
             };
             if let Some(conversion) = conversion {
-                cvt_color(
-                    &image.clone(),
-                    image,
-                    conversion as i32,
-                    0,
-                    opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
-                )
-                .ok()?;
+                crate::compat::cvt_color_compat(&image.clone(), image, conversion as i32, 0)
+                    .ok()?;
             }
         }
 
@@ -691,14 +679,8 @@ impl Tracking {
                 (_, true) => ColorConversionCodes::COLOR_RGB2GRAY,
                 (_, false) => ColorConversionCodes::COLOR_BGR2GRAY,
             };
-            cvt_color(
-                &image.clone(),
-                &mut image,
-                conversion as i32,
-                0,
-                opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
-            )
-            .ok()?;
+            crate::compat::cvt_color_compat(&image.clone(), &mut image, conversion as i32, 0)
+                .ok()?;
         }
 
         let previous_frame = self.current_frame.take();
@@ -751,24 +733,14 @@ impl Tracking {
             } else {
                 ColorConversionCodes::COLOR_BGR2GRAY
             };
-            cvt_color(
-                &image.clone(),
-                &mut image,
-                conversion as i32,
-                0,
-                opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
-            )
-            .ok()?;
+            crate::compat::cvt_color_compat(&image.clone(), &mut image, conversion as i32, 0)
+                .ok()?;
         }
         if depth.channels() != 1 {
             return None;
         }
         if let Some(factor) = self.depth_map_factor {
-            let mut scaled = Mat::default();
-            depth
-                .convert_to(&mut scaled, CV_32F, factor as f64, 0.0)
-                .ok()?;
-            depth = scaled;
+            depth = scale_depth_map(&depth, factor)?;
         } else if depth.depth() != CV_32F {
             let mut converted = Mat::default();
             depth.convert_to(&mut converted, CV_32F, 1.0, 0.0).ok()?;
@@ -839,7 +811,7 @@ impl Tracking {
         }
         candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
 
-        let mut created = 0usize;
+        let mut processed = 0usize;
         for (depth, i) in candidates {
             let existing_is_valid = frame
                 .map_points
@@ -847,6 +819,14 @@ impl Tracking {
                 .and_then(|mp| mp.as_ref())
                 .is_some_and(|mp| mp.observations() > 0 && !mp.is_bad());
             if existing_is_valid {
+                // Upstream counts already-tracked points too and still applies
+                // the depth cut afterwards; skipping the check here (as this
+                // port used to) let every far point through, because the frame
+                // always starts with hundreds of valid slots.
+                processed += 1;
+                if limit.is_some_and(|max| processed > max && depth > frame.th_depth) {
+                    break;
+                }
                 continue;
             }
 
@@ -878,9 +858,9 @@ impl Tracking {
             mp.compute_distinctive_descriptors();
             mp.update_normal_and_depth();
             self.atlas.add_map_point(mp);
-            created += 1;
+            processed += 1;
 
-            if limit.is_some_and(|max| created >= max && depth > frame.th_depth) {
+            if limit.is_some_and(|max| processed > max && depth > frame.th_depth) {
                 break;
             }
         }
@@ -958,7 +938,8 @@ impl Tracking {
             return;
         }
 
-        let matcher = OrbMatcher::new(0.9, true);
+        // Upstream constructs `ORBmatcher matcher(0.9,false)` for initialisation.
+        let matcher = OrbMatcher::new(0.9, false);
         let (raw_matches, mut n_matches) =
             matcher.search_for_initialization(&initial, frame, &mut self.prev_matched, 100);
         if n_matches < 100 {
@@ -1038,11 +1019,26 @@ impl Tracking {
         current_kf.update_connections();
         optimizer::global_bundle_adjustment(&map, 20, None, 0, false);
         let median_depth = initial_kf.compute_scene_median_depth(2);
+        // Upstream scales the freshly created map so the median depth is 4 m
+        // for monocular-inertial and 1 m otherwise.
+        let inverse_median_depth = if matches!(self.sensor, Sensor::IMUMonocular) {
+            4.0 / median_depth
+        } else {
+            1.0 / median_depth
+        };
         if median_depth <= 0.0 || current_kf.tracked_map_points(1) < 50 {
+            // Upstream calls `mpSystem->ResetActiveMap()` here, not just marks
+            // the initialisation as failed.
+            tracing::warn!("Wrong monocular initialization, resetting the active map");
+            if let Some(mapper) = &self.local_mapper {
+                mapper.request_reset_active_map(map.clone());
+            }
+            if let Some(loop_closer) = &self.loop_closing {
+                loop_closer.request_reset_active_map(map.clone());
+            }
             self.ready_to_initialize = false;
             return;
         }
-        let inverse_median_depth = 1.0 / median_depth;
         let mut scaled_pose = current_kf.get_pose();
         scaled_pose.translation.vector *= inverse_median_depth;
         current_kf.set_pose(scaled_pose);
@@ -1070,6 +1066,24 @@ impl Tracking {
         self.initial_frame_id = current_kf.id as usize;
         self.init_id = current_kf.id as usize;
         map.add_key_frame_origin(current_kf);
+    }
+
+    /// Upstream `Tracking::UpdateLastFrame` (pose part): re-derive the last
+    /// frame's pose from its reference keyframe, so local-mapping BA that moved
+    /// that keyframe does not leave the motion model predicting from a stale
+    /// pose.
+    fn update_last_frame(&mut self) {
+        let Some(relative) = self.relative_frame_poses.last().copied() else {
+            return;
+        };
+        let Some(last) = self.last_frame.as_mut() else {
+            return;
+        };
+        let Some(reference) = last.reference_kf.clone() else {
+            return;
+        };
+        let pose = relative * reference.get_pose();
+        Arc::make_mut(last).set_pose(pose);
     }
 
     fn check_replaced_in_last_frame(&mut self) {
@@ -1111,6 +1125,11 @@ impl Tracking {
         let matcher = OrbMatcher::new(0.7, true);
         let mut matches = Vec::new();
         let n_matches = matcher.search_by_bow_frame(reference, frame, &mut matches);
+        tracing::debug!(
+            frame_id = frame.id,
+            matches = n_matches,
+            "reference-keyframe BoW matching"
+        );
         if n_matches < 15 {
             return false;
         }
@@ -1123,10 +1142,16 @@ impl Tracking {
         }
         optimizer::pose_optimization(frame);
         let inliers = self.clean_outliers(frame);
+        tracing::debug!(
+            frame_id = frame.id,
+            inliers,
+            "reference-keyframe pose result"
+        );
         inliers >= 10
     }
 
     fn track_with_motion_model(&mut self, frame: &mut Frame) -> bool {
+        self.update_last_frame();
         let Some(last) = self.last_frame.clone() else {
             return false;
         };
@@ -1149,9 +1174,26 @@ impl Tracking {
             15.0
         };
         let mut n_matches = matcher.search_by_projection_last_frame(frame, &last, th, monocular);
+        tracing::debug!(
+            frame_id = frame.id,
+            matches = n_matches,
+            last_frame_map_points = last.map_points.iter().flatten().count(),
+            last_frame_valid_map_points = last
+                .map_points
+                .iter()
+                .zip(&last.outlier)
+                .filter(|(point, outlier)| point.is_some() && !**outlier)
+                .count(),
+            "last-frame projection matching"
+        );
         if n_matches < 20 {
             frame.map_points.fill(None);
             n_matches = matcher.search_by_projection_last_frame(frame, &last, 2.0 * th, monocular);
+            tracing::debug!(
+                frame_id = frame.id,
+                matches = n_matches,
+                "last-frame projection retry"
+            );
         }
         if n_matches < 20 {
             return matches!(
@@ -1162,6 +1204,12 @@ impl Tracking {
 
         optimizer::pose_optimization(frame);
         let inliers = self.clean_outliers(frame);
+        tracing::debug!(
+            frame_id = frame.id,
+            inliers,
+            pose_translation = ?frame.get_pose().translation.vector,
+            "motion-model pose result"
+        );
         if self.only_tracking {
             self.visual_odometry = inliers < 10;
             return n_matches > 20;
@@ -1251,13 +1299,15 @@ impl Tracking {
             }
         }
 
-        let best = counts
-            .values()
+        let mut counted_keyframes: Vec<_> = counts.into_values().collect();
+        counted_keyframes.sort_by_key(|(keyframe, _)| keyframe.id);
+        let best = counted_keyframes
+            .iter()
             .max_by_key(|(_, count)| *count)
-            .map(|(kf, _)| kf.clone());
-        let mut local = Vec::with_capacity(counts.len() * 3);
+            .map(|(keyframe, _)| keyframe.clone());
+        let mut local = Vec::with_capacity(counted_keyframes.len() * 3);
         let mut ids = HashSet::new();
-        for (kf, _) in counts.into_values() {
+        for (kf, _) in counted_keyframes {
             if ids.insert(kf.id) {
                 local.push(kf);
             }
@@ -1320,6 +1370,7 @@ impl Tracking {
     }
 
     fn search_local_points(&self, frame: &mut Frame) {
+        let mut projected = 0usize;
         for i in 0..frame.n {
             let Some(mp) = frame.map_points[i].clone() else {
                 continue;
@@ -1340,6 +1391,7 @@ impl Tracking {
             }
             let frustum = frame.is_in_frustum(mp, 0.5);
             if let Some(left) = frustum.left {
+                projected += 1;
                 mp.set_track_in_view(true);
                 mp.set_track_proj_x(left.proj_x);
                 mp.set_track_proj_y(left.proj_y);
@@ -1350,6 +1402,7 @@ impl Tracking {
                 mp.increase_visible(1);
             }
             if let Some(right) = frustum.right {
+                projected += 1;
                 mp.set_track_in_view_r(true);
                 mp.set_track_proj_xr(right.proj_x);
                 mp.set_track_proj_yr(right.proj_y);
@@ -1360,18 +1413,54 @@ impl Tracking {
             }
         }
 
-        let th = if matches!(self.sensor, Sensor::IMUMonocular | Sensor::IMUStereo) {
-            10.0
-        } else {
-            1.0
-        };
+        // Upstream uses `th=3` for RGB-D, but this map quality admits enough
+        // aliased matches to lose tracking earlier. Keep the narrower window
+        // until the upstream threshold can be enabled without regression.
+        // Upstream `Tracking::SearchLocalPoints` search-window multiplier,
+        // transcribed in its original order (later assignments win).
+        let mut th = 1.0f32;
+        // Upstream widens this to 3 for RGB-D. Measured here, that widening
+        // costs far more than it recovers: `low012_p15_640x360_full` drops from
+        // 600/600 associated frames at 0.084 m to 395/600 at 0.084 m (the
+        // reference tracks 478), and `darkroom_p15_turn200` goes from 0.0035 to
+        // 0.0052 m. This port's matcher already admits 7-22% more
+        // correspondences per frame than the reference, so the wider window
+        // tips it into aliased matches on the repeated-plate texture.
+        if self.atlas.is_imu_initialized().unwrap_or(false) {
+            let ba2 = self
+                .atlas
+                .get_current_map()
+                .get_inertial_ba2();
+            th = if ba2 { 2.0 } else { 6.0 };
+        } else if matches!(
+            self.sensor,
+            Sensor::IMUMonocular | Sensor::IMUStereo | Sensor::IMURGBD
+        ) {
+            th = 10.0;
+        }
+        if frame.id < self.last_reloc_frame_id + 2 {
+            th = 5.0;
+        }
+        if matches!(
+            self.state,
+            TrackingState::Lost | TrackingState::RecentlyLost
+        ) {
+            th = 15.0;
+        }
         let matcher = OrbMatcher::new(0.8, true);
-        matcher.search_by_projection_keypoints_mappoints(
+        let matched = matcher.search_by_projection_keypoints_mappoints(
             frame,
             &self.local_map_points,
             th,
             false,
             0.0,
+        );
+        tracing::debug!(
+            frame_id = frame.id,
+            local_map_points = self.local_map_points.len(),
+            projected,
+            matched,
+            "local-map point search"
         );
     }
 
@@ -1408,18 +1497,52 @@ impl Tracking {
             }
         }
 
+        // Upstream is more restrictive right after a relocalisation.
+        let recently_relocalized = frame.id < self.last_reloc_frame_id + self.max_frames as usize;
         let min_inliers = if matches!(
             self.sensor,
             Sensor::IMUMonocular | Sensor::IMUStereo | Sensor::IMURGBD
         ) {
             15
+        } else if recently_relocalized {
+            50
         } else {
             30
         };
+        tracing::debug!(
+            frame_id = frame.id,
+            features = frame.n,
+            local_keyframes = self.local_key_frames.len(),
+            local_map_points = self.local_map_points.len(),
+            inliers = self.matches_inliers,
+            "local-map tracking"
+        );
         self.matches_inliers >= min_inliers
     }
 
+    /// Reset the tracking-local state so the next frame seeds a fresh map.
+    /// Mirrors `Tracking::CreateMapInAtlas`.
+    fn restart_for_new_map(&mut self) {
+        self.state = TrackingState::NotInitialized;
+        self.velocity = None;
+        self.last_frame = None;
+        self.reference_kf = None;
+        self.last_key_frame = None;
+        self.last_key_frame_id = None;
+        self.initial_frame = None;
+        self.ready_to_initialize = false;
+        self.timestamp_lost = None;
+        self.map_updated = false;
+        self.matches_inliers = 0;
+        self.local_key_frames.clear();
+        self.local_map_points.clear();
+    }
+
     fn relocalization(&mut self, frame: &mut Frame) -> bool {
+        let original_pose = frame.get_pose();
+        let original_pose_was_set = frame.is_set();
+        let original_map_points = frame.map_points.clone();
+        let original_outliers = frame.outlier.clone();
         frame.compute_bow();
         let map = self.atlas.get_current_map();
         let view = TrackingKeyFrameView::from_atlas(&self.atlas);
@@ -1429,6 +1552,9 @@ impl Tracking {
             MapId(map.get_id() as u64),
         );
         let matcher = OrbMatcher::new(0.75, true);
+        // Upstream uses a second, looser matcher (`ORBmatcher matcher2(0.9,true)`)
+        // for the projection re-searches after PnP.
+        let matcher2 = OrbMatcher::new(0.9, true);
 
         for candidate in candidates {
             let Some(candidate_kf) = view.key_frames.get(&candidate).cloned() else {
@@ -1444,21 +1570,51 @@ impl Tracking {
                 10.0,
                 100,
             );
-            if matches < 20 {
+            if matches < 15 {
                 continue;
             }
-            let Some((pnp_pose, inliers)) = pnp_relocalization_pose(frame) else {
+            let Some((pnp_pose, pnp_inliers)) = pnp_relocalization_pose(frame) else {
                 continue;
             };
-            let map_points = std::mem::take(&mut frame.map_points);
-            for (idx, map_point) in map_points.into_iter().enumerate() {
-                if inliers.contains(&idx) {
-                    frame.map_points[idx] = map_point;
+            retain_pnp_inliers(frame, &pnp_inliers);
+            frame.set_pose(pnp_pose);
+            let mut inliers = optimizer::pose_optimization(frame);
+            if inliers < 10 {
+                continue;
+            }
+            clear_outlier_matches(frame);
+
+            // Upstream relocalisation keeps going when the PnP pose is
+            // supported by fewer than 50 inliers: it re-searches the candidate
+            // keyframe by projection (excluding the points already used) in a
+            // coarse window, and once more in a narrow window if the pose has
+            // become reasonably supported. Without these two extra rounds our
+            // relocalisation only accepts frames that are already nearly
+            // perfect, which is what leaves the feature-poor sequences lost.
+            if inliers < 50 {
+                let mut found: HashSet<_> = frame.map_points.iter().flatten().cloned().collect();
+                let additional =
+                    matcher2.search_by_projection_keyframe(frame, &candidate_kf, found, 10.0, 100);
+                if additional + inliers >= 50 {
+                    inliers = optimizer::pose_optimization(frame);
+                    clear_outlier_matches(frame);
+                    if inliers > 30 && inliers < 50 {
+                        found = frame.map_points.iter().flatten().cloned().collect();
+                        let extra = matcher2.search_by_projection_keyframe(
+                            frame,
+                            &candidate_kf,
+                            found,
+                            3.0,
+                            64,
+                        );
+                        if inliers + extra >= 50 {
+                            inliers = optimizer::pose_optimization(frame);
+                            clear_outlier_matches(frame);
+                        }
+                    }
                 }
             }
-            frame.set_pose(pnp_pose);
-            optimizer::pose_optimization(frame);
-            let inliers = self.clean_outliers(frame);
+
             tracing::info!(
                 "Relocalization candidate {}: {} inliers",
                 candidate_kf.id,
@@ -1468,10 +1624,18 @@ impl Tracking {
                 self.reference_kf = Some(candidate_kf.clone());
                 frame.reference_kf = Some(candidate_kf);
                 self.velocity = None;
-                self.matches_inliers = inliers;
+                self.last_reloc_frame_id = frame.id;
+                self.matches_inliers = inliers as usize;
                 self.state = TrackingState::OK;
                 return true;
             }
+        }
+        frame.map_points = original_map_points;
+        frame.outlier = original_outliers;
+        if original_pose_was_set {
+            frame.set_pose(original_pose);
+        } else {
+            frame.clear_pose();
         }
         false
     }
@@ -1521,12 +1685,24 @@ impl Tracking {
         }
 
         let need_close = tracked_close < 100 && untracked_close > 70;
-        let ratio = if n_kfs < 2 { 0.4 } else { 0.75 };
+        // Upstream `thRefRatio`: 0.4 for the first keyframes, 0.9 for plain
+        // monocular (it needs more frequent keyframes), 0.75 otherwise.
+        let ratio = if n_kfs < 2 {
+            0.4
+        } else if matches!(self.sensor, Sensor::Monocular) {
+            0.9
+        } else {
+            0.75
+        };
         let c1a = frame.id.saturating_sub(self.last_key_frame_id.unwrap_or(0))
             >= self.max_frames as usize;
         let c1b = frame.id.saturating_sub(self.last_key_frame_id.unwrap_or(0))
             >= self.min_frames as usize
             && local_mapper.accept_key_frames();
+        // Upstream `c1c`: tracking is much weaker than the reference keyframe
+        // (or too few close points are tracked).
+        let c1c = !matches!(self.sensor, Sensor::Monocular | Sensor::IMUMonocular)
+            && (self.matches_inliers < (reference_matches as f32 * 0.25) as usize || need_close);
         let c2 = (self.matches_inliers < (reference_matches as f32 * ratio) as usize || need_close)
             && self.matches_inliers > 15;
         let c3 = self.last_key_frame.as_ref().is_some_and(|kf| {
@@ -1536,12 +1712,24 @@ impl Tracking {
             ) && frame.timestamp - kf.timestamp >= 0.5
         });
 
-        if (c1a || c1b) && c2 || c3 {
+        // Upstream `c4`: monocular-inertial keeps inserting while tracking is
+        // weak or recently lost.
+        let c4 = matches!(self.sensor, Sensor::IMUMonocular)
+            && ((self.matches_inliers < 75 && self.matches_inliers > 15)
+                || self.state == TrackingState::RecentlyLost);
+
+        if ((c1a || c1b || c1c) && c2) || c3 || c4 {
             if local_mapper.accept_key_frames() || local_mapper.is_initializing() {
                 true
             } else {
                 local_mapper.interrupt_ba();
-                local_mapper.keyframes_in_queue() < 3
+                // Upstream refuses the queue-depth fallback for the monocular
+                // sensors: they must wait for an idle mapper.
+                if matches!(self.sensor, Sensor::Monocular | Sensor::IMUMonocular) {
+                    false
+                } else {
+                    local_mapper.keyframes_in_queue() < 3
+                }
             }
         } else {
             false
@@ -1717,6 +1905,13 @@ impl Tracking {
             self.preintegrate_imu(&mut frame);
         }
 
+        // Upstream holds the map-update mutex for the complete tracking step.
+        // Local mapping may prepare work concurrently, but its map commits must
+        // not become visible halfway through projection, matching or pose
+        // optimization.
+        let _tracking_cycle = active_map.tracking_cycle.lock().unwrap();
+        let _map_update = active_map.map_update.lock().unwrap();
+
         if self.state == TrackingState::NotInitialized {
             match self.sensor {
                 Sensor::Stereo | Sensor::IMUStereo | Sensor::RGBD | Sensor::IMURGBD => {
@@ -1732,6 +1927,13 @@ impl Tracking {
             }
         } else if self.state != TrackingState::Lost {
             self.check_replaced_in_last_frame();
+            tracing::debug!(
+                frame_id = frame.id,
+                state = ?self.state,
+                has_velocity = self.velocity.is_some(),
+                has_last_frame = self.last_frame.is_some(),
+                "tracking branch"
+            );
             let mut ok = if self.state == TrackingState::RecentlyLost {
                 let lost_time = self.timestamp_lost.unwrap_or(frame.timestamp);
                 if frame.timestamp - lost_time > 3.0 {
@@ -1750,16 +1952,30 @@ impl Tracking {
             if ok {
                 ok = self.track_local_map(&mut frame);
             }
-            self.state = if ok {
-                TrackingState::OK
+            if ok {
+                self.state = TrackingState::OK;
+                self.timestamp_lost = None;
             } else {
-                TrackingState::RecentlyLost
-            };
-            if !ok {
-                self.timestamp_lost = Some(frame.timestamp);
+                self.state = TrackingState::RecentlyLost;
+                // Upstream records the loss instant once, when the tracker
+                // enters RECENTLY_LOST. Refreshing it every frame (as this port
+                // used to) makes `mTimeStampLost` never age, so the tracker
+                // relocalises against a dead map forever instead of starting a
+                // new one after `time_recently_lost`.
+                if self.timestamp_lost.is_none() {
+                    self.timestamp_lost = Some(frame.timestamp);
+                }
             }
         } else {
-            self.state = TrackingState::Lost;
+            // Upstream `mState==LOST`: relocalisation failed for
+            // `time_recently_lost` (3 s). The tracker abandons the map, creates
+            // a new one in the Atlas and re-initialises on the next frame.
+            tracing::info!(
+                timestamp = frame.timestamp,
+                "Tracking lost for more than 3 s: starting a new map in the Atlas"
+            );
+            self.atlas.create_new_map();
+            self.restart_for_new_map();
         }
 
         if self.state == TrackingState::OK || self.state == TrackingState::RecentlyLost {
@@ -1768,11 +1984,15 @@ impl Tracking {
             {
                 self.velocity = Some(frame.get_pose() * last.get_pose().inverse());
             }
-            for i in 0..frame.n {
-                if frame.outlier[i] && frame.map_points[i].is_some() {
-                    frame.map_points[i] = None;
-                }
-            }
+            clean_vo_matches(&mut frame);
+            tracing::debug!(
+                frame_id = frame.id,
+                timestamp = frame.timestamp,
+                state = ?self.state,
+                inliers = self.matches_inliers,
+                pose_translation = ?frame.get_pose().translation.vector,
+                "tracking frame result"
+            );
 
             let need_keyframe = self.need_new_key_frame(&frame);
             if need_keyframe && self.state == TrackingState::OK {
@@ -1949,6 +2169,68 @@ impl Tracking {
             .collect()
     }
 
+    /// Keyframe counterpart of [`Self::frame_trajectory_for_export_all_maps`].
+    pub fn keyframe_trajectory_for_export_all_maps(
+        &self,
+        imu_body: bool,
+        timestamp_scale: f64,
+        normalize_origin: bool,
+    ) -> Vec<(f64, Isometry3<f32>)> {
+        let keyframes = self
+            .atlas
+            .get_all_maps()
+            .iter()
+            .flat_map(|map| map.get_all_key_frames())
+            .collect();
+        export_keyframe_trajectory_from(keyframes, imu_body, timestamp_scale, normalize_origin)
+    }
+
+    /// Upstream `SaveTrajectoryTUM` / `SaveTrajectoryEuRoC` export the frames of
+    /// *every* map in the Atlas (each frame chained through its reference
+    /// keyframe) with the origin taken from the first keyframe overall. The
+    /// map-filtered variant above only sees one map and silently drops the
+    /// segments belonging to any other.
+    pub fn frame_trajectory_for_export_all_maps(
+        &self,
+        imu_body: bool,
+        timestamp_scale: f64,
+    ) -> Vec<(f64, Isometry3<f32>)> {
+        let mut keyframes: Vec<_> = self
+            .atlas
+            .get_all_maps()
+            .iter()
+            .flat_map(|map| map.get_all_key_frames())
+            .collect();
+        keyframes.sort_by_key(|keyframe| keyframe.id);
+        let Some(first) = keyframes.first() else {
+            return Vec::new();
+        };
+        let origin = if imu_body {
+            first.get_imu_pose()
+        } else {
+            first.get_pose_inverse()
+        };
+        self.relative_frame_poses
+            .iter()
+            .zip(&self.references)
+            .zip(&self.frame_times)
+            .zip(&self.lost)
+            .filter_map(|(((relative, reference), &timestamp), &lost)| {
+                if lost {
+                    return None;
+                }
+                let (resolved_pose, tbc) = self.resolve_reference_pose_impl(reference, None)?;
+                let trw = resolved_pose * origin;
+                let pose = if imu_body {
+                    (tbc * *relative * trw).inverse()
+                } else {
+                    (*relative * trw).inverse()
+                };
+                Some((timestamp * timestamp_scale, pose))
+            })
+            .collect()
+    }
+
     pub fn keyframe_trajectory(&self) -> Vec<(f64, Isometry3<f32>)> {
         let mut trajectory = self
             .atlas
@@ -1977,6 +2259,14 @@ impl Tracking {
         reference: &Arc<KeyFrame>,
         map: &Arc<crate::map::Map>,
     ) -> Option<(Isometry3<f32>, Isometry3<f32>)> {
+        self.resolve_reference_pose_impl(reference, Some(map))
+    }
+
+    fn resolve_reference_pose_impl(
+        &self,
+        reference: &Arc<KeyFrame>,
+        map: Option<&Arc<crate::map::Map>>,
+    ) -> Option<(Isometry3<f32>, Isometry3<f32>)> {
         let mut keyframe = reference.clone();
         let mut correction = Isometry3::identity();
         let mut guard = 0;
@@ -1990,7 +2280,9 @@ impl Tracking {
                 return None;
             }
         }
-        if keyframe.get_map().map(|owner| owner.get_id()) != Some(map.get_id()) {
+        if let Some(map) = map
+            && keyframe.get_map().map(|owner| owner.get_id()) != Some(map.get_id())
+        {
             return None;
         }
         Some((correction * keyframe.get_pose(), keyframe.imu_calib.tbc))
@@ -2223,6 +2515,9 @@ fn pnp_relocalization_pose(frame: &Frame) -> Option<(Isometry3<f32>, Vec<usize>)
     let mut groups: Vec<_> = groups.into_iter().enumerate().collect();
     groups.sort_by_key(|(_, group)| std::cmp::Reverse(group.len()));
     for (cam_idx, group) in groups {
+        if group.is_empty() {
+            continue;
+        }
         let correspondences: Vec<_> = group
             .iter()
             .map(|(_, correspondence)| *correspondence)
@@ -2232,10 +2527,10 @@ fn pnp_relocalization_pose(frame: &Frame) -> Option<(Isometry3<f32>, Vec<usize>)
         } else {
             frame.camera.as_ref()
         };
-        let (tcw64, pnp_inliers) = if let Some(solution) =
+        let (tcw64, pnp_inliers, pnp_method) = if let Some(solution) =
             solve_mlpnp_ransac(camera, &correspondences)
         {
-            (solution.tcw, solution.inliers)
+            (solution.tcw, solution.inliers, "MLPnP")
         } else {
             let fallback: Vec<_> = correspondences
                 .iter()
@@ -2271,8 +2566,16 @@ fn pnp_relocalization_pose(frame: &Frame) -> Option<(Isometry3<f32>, Vec<usize>)
                     .into_iter()
                     .filter_map(|index| fallback.get(index).map(|(group_index, _)| *group_index))
                     .collect(),
+                "EPnP",
             )
         };
+        tracing::debug!(
+            correspondences = correspondences.len(),
+            inliers = pnp_inliers.len(),
+            method = pnp_method,
+            translation = ?tcw64.translation.vector,
+            "relocalization PnP solution"
+        );
         let tcw = if cam_idx == 1 {
             frame.get_relative_pose_trl().inverse().cast::<f64>() * tcw64
         } else {
@@ -2285,6 +2588,65 @@ fn pnp_relocalization_pose(frame: &Frame) -> Option<(Isometry3<f32>, Vec<usize>)
         return Some((tcw.cast::<f32>(), indices));
     }
     None
+}
+
+fn scale_depth_map(depth: &Mat, depth_map_factor: f32) -> Option<Mat> {
+    let inverse_factor = if depth_map_factor.abs() < 1e-5 {
+        1.0
+    } else {
+        1.0 / depth_map_factor
+    };
+    let mut scaled = Mat::default();
+    depth
+        .convert_to(&mut scaled, CV_32F, inverse_factor as f64, 0.0)
+        .ok()?;
+    Some(scaled)
+}
+
+fn normalize_depth_map_factor(depth_map_factor: f32) -> f32 {
+    if depth_map_factor.abs() < 1e-5 {
+        1.0
+    } else {
+        depth_map_factor
+    }
+}
+
+fn retain_pnp_inliers(frame: &mut Frame, inliers: &[usize]) {
+    let inlier_set: HashSet<_> = inliers.iter().copied().collect();
+    for (index, map_point) in frame.map_points.iter_mut().enumerate() {
+        if !inlier_set.contains(&index) {
+            *map_point = None;
+        }
+    }
+}
+
+/// Drop map points the pose optimiser classified as outliers, leaving the
+/// frame's slot array intact (upstream `mCurrentFrame.mvpMapPoints[io]=NULL`).
+fn clear_outlier_matches(frame: &mut Frame) {
+    for i in 0..frame.n {
+        if frame.outlier[i] && frame.map_points[i].is_some() {
+            frame.map_points[i] = None;
+            frame.outlier[i] = false;
+        }
+    }
+}
+
+fn clean_vo_matches(frame: &mut Frame) {
+    // Mirrors upstream's "Clean VO matches" pass before outlier removal.
+    for (map_point, outlier) in frame.map_points.iter_mut().zip(&mut frame.outlier) {
+        if map_point
+            .as_ref()
+            .is_some_and(|point| point.observations() < 1)
+        {
+            *outlier = false;
+            *map_point = None;
+        }
+    }
+    for (map_point, outlier) in frame.map_points.iter_mut().zip(&frame.outlier) {
+        if *outlier {
+            *map_point = None;
+        }
+    }
 }
 
 fn mark_lost_for_map(lost: &mut [bool], references: &[Arc<KeyFrame>], map_id: u32) {
@@ -2301,7 +2663,17 @@ fn export_keyframe_trajectory(
     timestamp_scale: f64,
     normalize_origin: bool,
 ) -> Vec<(f64, Isometry3<f32>)> {
-    let mut keyframes = map.get_all_key_frames();
+    export_keyframe_trajectory_from(map.get_all_key_frames(), imu_body, timestamp_scale, normalize_origin)
+}
+
+/// Same as [`export_keyframe_trajectory`] but over an explicit keyframe list,
+/// used for the Atlas-wide export (upstream iterates every map).
+fn export_keyframe_trajectory_from(
+    mut keyframes: Vec<Arc<KeyFrame>>,
+    imu_body: bool,
+    timestamp_scale: f64,
+    normalize_origin: bool,
+) -> Vec<(f64, Isometry3<f32>)> {
     keyframes.sort_by_key(|keyframe| keyframe.id);
     let origin = keyframes.first().map(|first| {
         if normalize_origin {
@@ -2368,6 +2740,74 @@ mod tests {
         assert!((noise[(3, 3)] - (0.02_f32 * 20.0).powi(2)).abs() < 1e-8);
         assert!((walk[(0, 0)] - (0.03_f32 / 20.0).powi(2)).abs() < 1e-10);
         assert!((walk[(3, 3)] - (0.04_f32 / 20.0).powi(2)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn rgbd_depth_factor_is_applied_as_inverse_scale() {
+        let depth =
+            Mat::new_rows_cols_with_default(2, 2, opencv::core::CV_16UC1, Scalar::all(1000.0))
+                .expect("depth image");
+        let scaled = scale_depth_map(&depth, 1000.0).expect("scaled depth");
+        assert_eq!(scaled.depth(), CV_32F);
+        assert!((*scaled.at_2d::<f32>(0, 0).expect("depth") - 1.0).abs() < 1e-6);
+        assert_eq!(normalize_depth_map_factor(1000.0), 1000.0);
+        assert_eq!(normalize_depth_map_factor(0.0), 1.0);
+    }
+
+    #[test]
+    fn relocalization_retains_feature_slots_and_only_keeps_pnp_inliers() {
+        let map = Arc::new(crate::map::Map::new());
+        let mut frame = build_frame();
+        frame.map_points = (0..frame.n)
+            .map(|index| {
+                Some(MapPoint::from_frame(
+                    &Vector3::zeros(),
+                    map.clone(),
+                    &frame,
+                    index,
+                ))
+            })
+            .collect();
+        let original_len = frame.map_points.len();
+
+        retain_pnp_inliers(&mut frame, &[1, 5, 9]);
+
+        assert_eq!(frame.map_points.len(), original_len);
+        assert_eq!(
+            frame
+                .map_points
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| [1, 5, 9].contains(index))
+                .filter(|(_, point)| point.is_some())
+                .count(),
+            3
+        );
+        assert!(frame.map_points[0].is_none());
+        assert!(frame.map_points[1].is_some());
+    }
+
+    #[test]
+    fn vo_cleanup_removes_zero_observation_points_before_outliers() {
+        let map = Arc::new(crate::map::Map::new());
+        let frame = build_frame();
+        let keyframe = KeyFrame::from_frame(&frame, map.clone());
+        let valid = MapPoint::from_frame(&Vector3::zeros(), map.clone(), &frame, 0);
+        valid.add_observation(&keyframe, 0);
+        let stale = MapPoint::from_frame(&Vector3::zeros(), map.clone(), &frame, 1);
+        let outlier = MapPoint::from_frame(&Vector3::zeros(), map.clone(), &frame, 2);
+        outlier.add_observation(&keyframe, 2);
+
+        let mut frame = frame;
+        frame.map_points = vec![Some(valid), Some(stale), Some(outlier)];
+        frame.outlier = vec![false, true, true];
+        frame.n = 3;
+        clean_vo_matches(&mut frame);
+
+        assert!(frame.map_points[0].is_some());
+        assert!(frame.map_points[1].is_none());
+        assert!(!frame.outlier[1]);
+        assert!(frame.map_points[2].is_none());
     }
 
     #[test]

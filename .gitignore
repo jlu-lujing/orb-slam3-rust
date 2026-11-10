@@ -2,3 +2,7 @@
 /vocabulary/orbvoc.txt
 /recording
 notes.txt
+/CameraTrajectory.txt
+/KeyFrameTrajectory.txt
+/f_dataset*_CameraTrajectory.txt
+/f_dataset*_KeyFrameTrajectory.txt

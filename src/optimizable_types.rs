@@ -1172,3 +1172,86 @@ impl Edge for EdgeSim3 {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::camera_models::pinhole::Pinhole;
+    use crate::g2o_core::{SE3Quat, Vertex};
+    use nalgebra::{Translation3, UnitQuaternion};
+
+    fn test_pose() -> SE3Quat {
+        SE3Quat::from_isometry_f32(&nalgebra::Isometry3::from_parts(
+            Translation3::new(0.1, -0.2, 0.3),
+            UnitQuaternion::from_scaled_axis(Vector3::new(0.03, -0.02, 0.04)),
+        ))
+    }
+
+    fn check_point_and_pose_jacobian(edge: &mut dyn Edge, point: Vector3<f64>, pose: SE3Quat) {
+        let point_vertex = VertexSBAPointXYZ::new(point);
+        let pose_vertex = VertexSE3Expmap::new(pose);
+        let linearization = edge.linearize(&[&point_vertex, &pose_vertex]);
+        let base = linearization.error;
+        let eps = 1e-6;
+
+        for column in 0..3 {
+            let mut plus = point;
+            let mut minus = point;
+            plus[column] += eps;
+            minus[column] -= eps;
+            edge.compute_error(&[&VertexSBAPointXYZ::new(plus), &pose_vertex]);
+            let plus_error = edge
+                .linearize(&[&VertexSBAPointXYZ::new(plus), &pose_vertex])
+                .error;
+            edge.compute_error(&[&VertexSBAPointXYZ::new(minus), &pose_vertex]);
+            let minus_error = edge
+                .linearize(&[&VertexSBAPointXYZ::new(minus), &pose_vertex])
+                .error;
+            let numeric = (plus_error - minus_error) / (2.0 * eps);
+            let analytic = linearization.jacobians[0].column(column);
+            assert!(
+                (&numeric - analytic).norm() < 1e-4,
+                "point Jacobian mismatch at column {column}: base={base:?}, numeric={numeric:?}, analytic={analytic:?}"
+            );
+        }
+
+        for column in 0..6 {
+            let mut delta = Vector6::zeros();
+            delta[column] = eps;
+            let mut plus_pose = VertexSE3Expmap::new(pose);
+            let mut minus_pose = VertexSE3Expmap::new(pose);
+            plus_pose.oplus(delta.as_slice());
+            minus_pose.oplus((-delta).as_slice());
+            edge.compute_error(&[&point_vertex, &plus_pose]);
+            let plus_error = edge.linearize(&[&point_vertex, &plus_pose]).error;
+            edge.compute_error(&[&point_vertex, &minus_pose]);
+            let minus_error = edge.linearize(&[&point_vertex, &minus_pose]).error;
+            let numeric = (plus_error - minus_error) / (2.0 * eps);
+            let analytic = linearization.jacobians[1].column(column);
+            assert!(
+                (&numeric - analytic).norm() < 1e-4,
+                "pose Jacobian mismatch at column {column}: base={base:?}, numeric={:?}, analytic={:?}",
+                numeric.as_slice(),
+                analytic.as_slice(),
+            );
+        }
+    }
+
+    #[test]
+    fn reprojection_edges_match_finite_differences() {
+        let camera: Arc<dyn GeometricCamera> =
+            Arc::new(Pinhole::with_params(vec![500.0, 480.0, 320.0, 240.0]));
+        let point = Vector3::new(0.2, -0.1, 2.0);
+        let pose = test_pose();
+        let xyz = pose.map(&point);
+        let uv = camera.project_n_d(&Point3::from(xyz));
+
+        let mut mono = EdgeSE3ProjectXYZ::new(0, 1, camera.clone());
+        mono.set_measurement(Vector2::new(uv.x, uv.y));
+        check_point_and_pose_jacobian(&mut mono, point, pose);
+
+        let mut stereo = EdgeStereoSE3ProjectXYZ::new(0, 1, 500.0, 480.0, 320.0, 240.0, 25.0);
+        stereo.set_measurement(Vector3::new(uv.x, uv.y, uv.x - 25.0 / xyz.z));
+        check_point_and_pose_jacobian(&mut stereo, point, pose);
+    }
+}

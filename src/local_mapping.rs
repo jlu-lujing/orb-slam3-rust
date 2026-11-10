@@ -31,7 +31,7 @@
 //!
 //! ```text
 //! finish  <  stop  <  new_key_frames
-//! imu_init  <  Map::map_update          (BA / IMU init take the map lock last)
+//! imu_init  <  Map::tracking_cycle  <  Map::map_update
 //! ```
 //!
 //! Never hold a lock that is "earlier" in this list while waiting on an
@@ -46,7 +46,7 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::{
     atlas::Atlas, geometric_tools, imu_types::Bias, key_frame::KeyFrame,
@@ -277,6 +277,16 @@ impl LocalMapping {
 
             // check if there are keyframes in the queue
             if self.check_new_key_frames() && !self.bad_imu.load(Ordering::SeqCst) {
+                let cycle_map = self
+                    .new_key_frames
+                    .lock()
+                    .unwrap()
+                    .front()
+                    .and_then(|keyframe| keyframe.get_map());
+                let tracking_cycle = cycle_map
+                    .as_ref()
+                    .map(|map| map.tracking_cycle.lock().unwrap());
+
                 // BoW conversion and insertion in Map
                 timed!(
                     self.register_times,
@@ -298,6 +308,12 @@ impl LocalMapping {
                         self.search_in_neighbors();
                     }
                 });
+
+                // Inertial mapping queries Tracking below; release the cycle
+                // first to preserve the global lock order.
+                if self.inertial {
+                    drop(tracking_cycle);
+                }
 
                 if !self.check_new_key_frames()
                     && !self.stop_requested()
@@ -387,6 +403,32 @@ impl LocalMapping {
                     {
                         let prior_a = if self.monocular { 1e10 } else { 1e5 };
                         self.initialize_imu(1e2, prior_a, true);
+                    }
+
+                    if let Some(map) = current_keyframe.get_map()
+                        && self.inertial
+                        && map.is_imu_initialized()
+                    {
+                        let tracking_ok =
+                            self.tracker
+                                .get()
+                                .and_then(Weak::upgrade)
+                                .is_some_and(|tracker| {
+                                    tracker.lock().unwrap().get_tracking_state()
+                                        == crate::tracking::TrackingState::OK
+                                });
+                        if tracking_ok {
+                            let t_init = self.imu_init.lock().unwrap().t_init;
+                            if !map.get_inertial_ba1() {
+                                if t_init > 5.0 {
+                                    map.set_inertial_ba1();
+                                    self.initialize_imu(1.0, 1e5, true);
+                                }
+                            } else if !map.get_inertial_ba2() && t_init > 15.0 {
+                                map.set_inertial_ba2();
+                                self.initialize_imu(0.0, 0.0, true);
+                            }
+                        }
                     }
 
                     if self.inertial
@@ -636,10 +678,18 @@ impl LocalMapping {
             }
         }
 
+        let recent_count = recent.len();
         if !recent.is_empty() {
             self.recent_added_map_points.lock().unwrap().extend(recent);
         }
 
+        debug!(
+            keyframe_id = kf.id,
+            frame_id = kf.frame_id,
+            map_points = kf.get_number_mps(),
+            recent_map_points = recent_count,
+            "processing queued keyframe"
+        );
         kf.update_connections();
         self.atlas.add_key_frame(kf);
     }
@@ -857,10 +907,12 @@ impl LocalMapping {
         let min_observations = if self.monocular { 2 } else { 3 };
         let pending = std::mem::take(&mut *self.recent_added_map_points.lock().unwrap());
         let mut retained = Vec::with_capacity(pending.len());
+        let mut culled = 0usize;
 
         for mp in pending {
             if mp.is_bad() || mp.get_found_ratio() < 0.25 {
                 mp.set_bad_flag();
+                culled += 1;
                 continue;
             }
 
@@ -870,11 +922,18 @@ impl LocalMapping {
             let age = current_kf_id as i128 - first_kf_id;
             if age >= 2 && mp.observations() <= min_observations {
                 mp.set_bad_flag();
+                culled += 1;
             } else if age < 3 {
                 retained.push(mp);
             }
         }
 
+        debug!(
+            current_keyframe_id = current_kf_id,
+            culled,
+            retained = retained.len(),
+            "map-point culling"
+        );
         *self.recent_added_map_points.lock().unwrap() = retained;
     }
     fn search_in_neighbors(&self) {
@@ -975,7 +1034,9 @@ impl LocalMapping {
             u64::MAX
         };
 
-        for kf in current.get_vector_covisible_keyframes() {
+        let local_keyframes = current.get_vector_covisible_keyframes();
+        let mut culled = 0usize;
+        for kf in local_keyframes {
             if kf.id == init_kf_id || kf.is_bad() {
                 continue;
             }
@@ -1036,6 +1097,7 @@ impl LocalMapping {
                     if let Some(database) = self.atlas.get_key_frame_database() {
                         database.erase(KeyFrameId(kf.id), &kf.bow_vec);
                     }
+                    culled += 1;
                     continue;
                 }
                 let Some(map) = kf.get_map() else {
@@ -1074,8 +1136,10 @@ impl LocalMapping {
                 if let Some(database) = self.atlas.get_key_frame_database() {
                     database.erase(KeyFrameId(kf.id), &kf.bow_vec);
                 }
+                culled += 1;
             }
         }
+        debug!(current_keyframe_id = current.id, culled, "keyframe culling");
     }
 
     /// Apply a pending reset if one was requested
@@ -1266,14 +1330,14 @@ impl LocalMapping {
             tracker.update_frame_imu(scale as f32, bias, current.clone());
         }
 
-        if first && (prior_a != 0.0 || prior_g != 0.0) {
+        if first {
             optimizer::full_inertial_ba(
                 &map,
                 100,
                 false,
                 current.id,
                 Some(self.abort_ba.clone()),
-                true,
+                prior_a != 0.0,
                 prior_g,
                 prior_a,
             );
@@ -1452,5 +1516,79 @@ mod tests {
 
         assert!(mp.is_bad());
         assert!(mapping.recent_added_map_points.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn keyframe_culling_requires_more_than_three_other_views() {
+        let atlas = Arc::new(Atlas::from_kf_id(0));
+        let map = atlas.get_current_map();
+        let frame = build_frame();
+        let mut current = KeyFrame::from_frame(&frame, map.clone());
+        let mut candidate = KeyFrame::from_frame(&frame, map.clone());
+        let mut observer_a = KeyFrame::from_frame(&frame, map.clone());
+        let mut observer_b = KeyFrame::from_frame(&frame, map.clone());
+        let mut observer_c = KeyFrame::from_frame(&frame, map.clone());
+        let mut observer_d = KeyFrame::from_frame(&frame, map.clone());
+        Arc::get_mut(&mut current).expect("unique current").id = 100;
+        Arc::get_mut(&mut candidate).expect("unique candidate").id = 101;
+        Arc::get_mut(&mut observer_a).expect("unique observer").id = 102;
+        Arc::get_mut(&mut observer_b).expect("unique observer").id = 103;
+        Arc::get_mut(&mut observer_c).expect("unique observer").id = 104;
+        Arc::get_mut(&mut observer_d).expect("unique observer").id = 105;
+        map.set_init_kf_id(current.id);
+
+        for index in 0..10 {
+            let mp = MapPoint::from_pos_ref(
+                &Vector3::new(index as f32, 0.0, 5.0),
+                candidate.clone(),
+                map.clone(),
+            );
+            for keyframe in [&current, &candidate] {
+                mp.add_observation(keyframe, index);
+                keyframe.add_map_point(mp.clone(), index as usize);
+            }
+            map.add_map_point(mp);
+        }
+        current.update_connections();
+        candidate.update_connections();
+        for observer in [&observer_a, &observer_b, &observer_c, &observer_d] {
+            for index in 0..10 {
+                let point = candidate.get_map_point(index).expect("candidate point");
+                point.add_observation(observer, index as i32);
+                observer.add_map_point(point, index);
+            }
+        }
+        assert!(
+            current
+                .get_vector_covisible_keyframes()
+                .iter()
+                .any(|keyframe| keyframe.id == candidate.id)
+        );
+        assert!(
+            candidate
+                .get_map_points()
+                .iter()
+                .all(|point| point.observations() > 3)
+        );
+
+        // The helper frame has no stereo depth, so exercise the monocular
+        // branch rather than dropping every point at the depth threshold.
+        let mapping = LocalMapping::new(
+            Arc::new(System::new_for_test(crate::system::Sensor::Stereo)),
+            atlas,
+            true,
+            false,
+            "test".to_owned(),
+        );
+        *mapping.current_key_frame.lock().unwrap() = Some(current.clone());
+        assert!(
+            current
+                .get_vector_covisible_keyframes()
+                .iter()
+                .any(|keyframe| keyframe.id == candidate.id)
+        );
+        mapping.key_frame_culling();
+
+        assert!(candidate.is_bad());
     }
 }

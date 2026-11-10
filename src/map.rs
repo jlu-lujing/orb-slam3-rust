@@ -121,6 +121,9 @@ pub struct Map {
 
     /// Held by LocalMapping/LoopClosing around multi-step map edits
     pub map_update: Mutex<()>,
+    /// Serialises Local Mapping's graph-editing phase with a complete tracking
+    /// step so tracking cannot observe a partially committed keyframe update.
+    pub tracking_cycle: Mutex<()>,
     /// Serialises map-point creation so two threads cannot mint the same id
     pub point_creation: Mutex<()>,
 }
@@ -153,6 +156,7 @@ impl Map {
             key_frame_origins: RwLock::new(Vec::new()),
             first_region_kf: RwLock::new(None),
             map_update: Mutex::new(()),
+            tracking_cycle: Mutex::new(()),
             point_creation: Mutex::new(()),
         }
     }

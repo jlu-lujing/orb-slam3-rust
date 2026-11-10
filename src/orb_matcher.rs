@@ -264,7 +264,7 @@ impl OrbMatcher {
         let twc = t_wc.translation.vector;
 
         let t_lw = last_frame.get_pose();
-        let tlc = t_lw * twc;
+        let tlc = t_lw * Point3::from(twc);
 
         let forward = tlc.z > current_frame.b && !mono;
         let backward = -tlc.z > current_frame.b && !mono;
@@ -274,9 +274,11 @@ impl OrbMatcher {
             if let Some(Some(mp)) = mp
                 && !last_frame.outlier[i]
             {
-                // Project
+                // Project. `Isometry3 * Vector3` only rotates in nalgebra
+                // (vectors are directions), so the point must go through
+                // `Point3` to include the camera translation.
                 let x_3dw = mp.get_world_pos();
-                let x_3dc = t_cw * x_3dw;
+                let x_3dc = (t_cw * Point3::from(x_3dw)).coords;
 
                 let inv_zc = 1.0 / x_3dc[2];
 
@@ -552,7 +554,7 @@ impl OrbMatcher {
             {
                 // Project
                 let x_3dw = mp.get_world_pos();
-                let x_3dc = t_cw * x_3dw;
+                let x_3dc = (t_cw * Point3::from(x_3dw)).coords;
 
                 let uv = current_frame.camera.project_n(&Point3::from(x_3dc));
 
@@ -698,7 +700,7 @@ impl OrbMatcher {
             let p3dw = mp.get_world_pos();
 
             // Transform into Camera Coords
-            let p3dc = t_cw * p3dw;
+            let p3dc = (t_cw * Point3::from(p3dw)).coords;
 
             // Depth must be positive
             if p3dc[2] < 0. {
@@ -813,7 +815,7 @@ impl OrbMatcher {
             let p3dw = mp.get_world_pos();
 
             // Transform into Camera Coords
-            let p3dc = t_cw * p3dw;
+            let p3dc = (t_cw * Point3::from(p3dw)).coords;
 
             // Depth must be positive
             if p3dc[2] < 0. {
@@ -1109,7 +1111,7 @@ impl OrbMatcher {
     // Search matches between MapPoints already associated to two KeyFrames,
     // constrained to ORB that belong to the same vocabulary node.
     // Used in Loop Detection.
-    fn search_by_bow_keyframe(
+    pub(crate) fn search_by_bow_keyframe(
         &self,
         kf1: &KeyFrame,
         kf2: &KeyFrame,
@@ -1249,10 +1251,8 @@ impl OrbMatcher {
 
         let mut matches12 = vec![-1; f1.keys_un.as_ref().unwrap().len()];
 
-        let mut rot_hist: [Vec<usize>; HISTO_LENGTH] =
-            std::array::from_fn(|_| Vec::with_capacity(500));
-        let factor = 1.0 / HISTO_LENGTH as f32;
-
+        // Upstream `SearchForInitialization` does not run the rotation-histogram
+        // filter; it only applies the descriptor distance and ratio tests.
         let f2_keys_un_len = f2.keys_un.as_ref().unwrap().len();
         let mut matched_distance = vec![i32::MAX; f2_keys_un_len];
         let mut matches21: Vec<i32> = vec![-1; f2_keys_un_len];
@@ -1306,34 +1306,6 @@ impl OrbMatcher {
                 matched_distance[best_idx2 as usize] = best_dist;
                 n_matches += 1;
 
-                if self.check_orientation {
-                    let mut rot = f1.keys_un.as_ref().unwrap()[i1].angle()
-                        - f2.keys_un.as_ref().unwrap()[best_idx2 as usize].angle();
-                    if rot < 0. {
-                        rot += 360.;
-                    }
-                    let mut bin = (rot * factor).round() as usize;
-                    if bin == HISTO_LENGTH {
-                        bin = 0;
-                    }
-                    debug_assert!(bin < HISTO_LENGTH);
-                    rot_hist[bin].push(i1);
-                }
-            }
-        }
-
-        if self.check_orientation {
-            let maxima = compute_three_maxima(&rot_hist);
-            for i in 0..HISTO_LENGTH {
-                if Some(i) != maxima[0] && Some(i) != maxima[1] && Some(i) != maxima[2] {
-                    for j in 0..rot_hist[i].len() {
-                        let idx1 = rot_hist[i][j];
-                        if matches12[idx1] >= 0 {
-                            matches12[idx1] = -1;
-                            n_matches -= 1;
-                        }
-                    }
-                }
             }
         }
 
