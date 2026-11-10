@@ -190,16 +190,15 @@ impl IntegratedRotation {
         let w = v.cross_matrix();
 
         let delta_t = 0.0;
-        let delta_r;
-        let right_j;
-        if d < EPS {
-            delta_r = Matrix3::identity() + w;
-            right_j = Matrix3::identity();
+        let (delta_r, right_j) = if d < EPS {
+            (Matrix3::identity() + w, Matrix3::identity())
         } else {
-            delta_r = Matrix3::identity() + w * (d.sin() / d) + w * w * ((1.0_f32 - d.cos()) / d2);
-            right_j = Matrix3::identity() - w * ((1.0_f32 - d.cos()) / d2)
-                + w * w * ((d - d.sin()) / (d2 * d));
-        }
+            (
+                Matrix3::identity() + w * (d.sin() / d) + w * w * ((1.0_f32 - d.cos()) / d2),
+                Matrix3::identity() - w * ((1.0_f32 - d.cos()) / d2)
+                    + w * w * ((d - d.sin()) / (d2 * d)),
+            )
+        };
 
         IntegratedRotation {
             delta_t,
