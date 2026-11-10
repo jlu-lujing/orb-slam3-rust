@@ -194,13 +194,26 @@ impl LoopClosing {
         let candidates = self
             .database
             .detect_n_best_candidates(&view, KeyFrameId(current.id), 5);
+        tracing::debug!(
+            kf = current.id,
+            n_loop_candidates = candidates.loop_.len(),
+            n_merge_candidates = candidates.merge.len(),
+            "loop-closing candidates"
+        );
         if self.active_loop_closing {
             let mut loop_geometry_found = false;
             for candidate in candidates.loop_ {
                 let Some(loop_kf) = view.key_frames.get(&candidate).cloned() else {
                     continue;
                 };
-                if let Some((sim3, common_regions)) = self.detect_sim3(&current, &loop_kf) {
+                let found = self.detect_sim3(&current, &loop_kf);
+                tracing::debug!(
+                    kf = current.id,
+                    candidate = loop_kf.id,
+                    found = found.is_some(),
+                    "loop-closing detect_sim3"
+                );
+                if let Some((sim3, common_regions)) = found {
                     loop_geometry_found = true;
                     if common_regions >= 3
                         || self.confirm_candidate(

@@ -246,7 +246,9 @@ impl Settings {
         let viewer = Self::read_viewer(&settings);
         let load_and_save = Self::read_load_and_save(&settings);
         let other = Self::read_other(&settings);
-        let loop_closing = read_param_bool(&settings, "loopClosing").unwrap_or(false);
+        // Upstream always constructs `LoopClosing` with `bActiveLC = true`;
+        // there is no such switch in the settings file of any example.
+        let loop_closing = read_param_bool(&settings, "loopClosing").unwrap_or(true);
 
         // Precompute rectification maps
         let mut stereo = None;

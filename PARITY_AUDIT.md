@@ -370,6 +370,38 @@ The three short sequences reproduce to the millimetre; `darkroom_full` differs
 by 4% (inside that sequence's own run-to-run spread) and `low012_p15_40_d435i`
 by 2%, both consistent with OpenCV 4.8 vs 4.11 feature extraction.
 
+## Loop closing was off by default
+
+Building a revisiting sequence (see below) exposed a real defect: the settings
+parser read `loopClosing` as `read_param_bool(...).unwrap_or(false)`, so unless a
+camera file explicitly enabled it, `LoopClosing` ran but every candidate check
+was skipped - no sequence ever exercised the loop path and the logs carried no
+`loop_closing` target at all. Upstream constructs `LoopClosing` with
+`bActiveLC = true` unconditionally and has no such key in any example config, so
+the default is now `true` (the key can still turn it off).
+
+With it enabled the new revisit sequence produces `Loop detected: current KF 286
+matched KF 9`, and the run that took it closes the loop with ATE 0.222 m against
+0.372 m for the same frames without the detection. The sequence is noisy
+(replaying identical frames twice makes candidate selection ambiguous and the
+run-to-run spread is large: 0.12-0.47 m across three runs), so it is a smoke test
+for the loop path rather than a benchmark. The reference detects no loop on it at
+all (ATE 0.204 m, 0 loop messages).
+
+## Revisiting sequences for the loop path
+
+`orb-slam3-simulation` gained a `path_mode="loop"` in `scan_trajectory.py`: the
+boustrophedon scan followed by the same lanes retraced, so the camera returns to
+its start. `data/steel_plate_lab_loop3_640x360` (1200 frames) is rendered from
+`scenes/steel_plate_lab.blend`; `data/steel_plate_lab_loop4_640x360` mirrors its
+second half onto the first (same images, timestamps continuing) so every frame is
+a literal revisit - relative symlinks, no extra rendering.
+
+Sequences rendered from `scenes/steel_plate_lab_v12.blend` are not usable: both
+this port and the reference lose tracking on them within the first third, so v12
+was abandoned for this purpose. The dataset the stored baselines use is
+`scenes/steel_plate_lab.blend`, which is what the loop renders above start from.
+
 ## Verification commands
 
 ```bash
