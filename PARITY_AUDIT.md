@@ -1,14 +1,26 @@
 # ORB-SLAM3 parity audit
 
-Audit date: 2026-11-09
+Audit date: 2026-11-10
 
 Reference: `3rdparty/ORB_SLAM3` at `4452a3c4ab75`
 
 This document distinguishes code completeness from accuracy parity. The Rust
-port is independently implemented. Same-input RGB-D comparisons against the
-C++ build now show full association on all benchmark sequences, with
-equal-or-better ATE on six of seven; one 40-frame D435i case remains within
-about 12% of C++.
+port is independently implemented, so bit-identical trajectories are not the
+goal and not achievable: RANSAC sampling and thread interleaving differ. What is
+claimed here is that the same algorithms with the same parameters produce
+statistically indistinguishable (mostly better) trajectories, and that every
+remaining difference is named and measured.
+
+Reference numbers in this file were produced against a C++ build of
+`3rdparty/ORB_SLAM3`, repeatedly, because that implementation is itself
+nondeterministic (2-3x spread on the hardest sequence for a single binary). The
+trajectories are medians of at least three runs.
+
+The benchmark sequences are TUM RGB-D format RGB-D recordings (320x180 and
+640x360, 20 fps, ~0.4 m to 4 m depth) rendered from a Blender scene in a
+separate simulation workspace. They are not distributed with this repository;
+any TUM-format RGB-D sequence can be run with `tum_rgbd` and scored with
+`trajectory_eval`, which is the same pair of tools used for every number below.
 
 ## Audit method
 
